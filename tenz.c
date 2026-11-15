@@ -1,11 +1,11 @@
 /*
- * tenz 0.23 - lossless compressor for GGUF models (file format 23)
+ * tenz 0.25 - lossless compressor for GGUF models (file format 25)
  *
  * Successor of foldz (versions 0.9 to 0.15; 0.16 was never released). The numbers continue:
  * foldz files need the foldz version that made them.
  *
- * The version and the file format share one number: tenz 0.23 writes and reads format 23
- * (magic "TENZ23"). Until 1.0 the format may change between versions; a file is only
+ * The version and the file format share one number: tenz 0.25 writes and reads format 25
+ * (magic "TENZ25"). Until 1.0 the format may change between versions; a file is only
  * guaranteed to decompress with the version that made it. Check with: tenz v
  *
  * Works on GGUF and safetensors files (and, with the byte model alone, any other file): tensors of the supported types are coded with
@@ -26,6 +26,9 @@
  *               2048 blocks. Or, if smaller, the AWQ lattice (its own static tables,
  *               same lanes; lattice steps given their column, errors, as symbols)
  *               (models converted from 4-bit AWQ/GPTQ checkpoints).
+ *   Q3_K        values: context = the size of the sub-block's scale (other contexts gain almost
+ *               nothing on real data), decoded by full tables. Header: d (fp16, as nibbles),
+ *               scales (2 + 4 bits). Whole blocks in 4 rANS lanes, Q6_K's lane layout.
  *   Q8_0        values: context = column sign bias, extremes seen, average
  *               magnitude so far in the block (two 4-bit symbols each). Header: d (fp16,
  *               as nibbles, given the previous block's d). Whole blocks in 4 rANS lanes.
@@ -63,6 +66,9 @@
  * Usage:  tenz c model.gguf model.tenz [-t threads] [-s segment_MiB] [-m MiB] [-q]
  *         tenz d model.tenz model.gguf [-t threads] [-m MiB]
  *         tenz t model.gguf [-t threads] [-s segment_MiB] [-m MiB] [-q]   (round trip in memory)
+ *         -g (c, t; experimental): Q4_K coded so a GPU can decode it (OpenCL, loaded at run time when
+ *         decompressing; the CPU if none, or as well). TENZ_GPU=0: CPU only, 2: GPU only; TENZ_GPU_CHECK=1:
+ *         compare every GPU segment with the CPU (the first one always is)
  * Memory: segments start only while their estimated memory fits in what the device has free,
  *         keeping a reserve for the system and other apps; -m sets a fixed limit instead.
  */
@@ -104,20 +110,21 @@
 #include <sys/sysctl.h>
 #endif
 
-#define TENZ_VERSION "0.23"
-#define TENZ_FORMAT "23"                               /* the number in MAGIC */
+#define TENZ_VERSION "0.25"
+#define TENZ_FORMAT "25"                               /* the number in MAGIC */
 #define KQ_LANES 4                     /* rANS lanes of Q4_K and Q5_K (8 was measured: no faster) */
-static const char MAGIC[8] = {'T','E','N','Z','2','3','\n', 0};    /* file format 23 */
+static const char MAGIC[8] = {'T','E','N','Z','2','4','\n', 0};    /* file format 24 */
 /* T_M32: a GGUF metadata array of 32-bit values, coded as F32; T_STRS: whole records of a GGUF
    string array; T_BYTES: everything else outside the tensors */
-enum { T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q8_0 = 8, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_BF16 = 30,
+enum { T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q8_0 = 8, T_Q3K = 11, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_BF16 = 30,
        T_M32 = 0xFFFD, T_STRS = 0xFFFE, T_BYTES = 0xFFFF };
-enum { M_NORMAL = 0, M_LATTICE = 1, M_QUICK = 2, M_RAW = 255 };   /* M_QUICK: -q (Q4_K, Q5_K, Q4_0, Q8_0, floats) */
+enum { M_NORMAL = 0, M_LATTICE = 1, M_QUICK = 2, M_GPU = 3, M_RAW = 255 };   /* M_GPU: -g Q4_K */
+static int G_GPUENC;                                  /* compress -g */
 static inline uint32_t fl_type(uint32_t t) { return t == T_M32 ? T_F32 : t; }   /* the float model's type */
 
 typedef struct { uint32_t id; int vpb, bs; const char *name; } TypeInfo;
 static const TypeInfo TYPES[] = {
-    {T_Q4K, 256, 144, "Q4_K"}, {T_Q5K, 256, 176, "Q5_K"}, {T_Q6K, 256, 210, "Q6_K"},
+    {T_Q3K, 256, 110, "Q3_K"}, {T_Q4K, 256, 144, "Q4_K"}, {T_Q5K, 256, 176, "Q5_K"}, {T_Q6K, 256, 210, "Q6_K"},
     {T_Q4_0, 32, 18, "Q4_0"}, {T_Q8_0, 32, 34, "Q8_0"}, {T_BF16, 1, 2, "BF16"}, {T_F16, 1, 2, "F16"}, {T_F32, 1, 4, "F32"},
     {T_M32, 1, 4, "kv32"},               /* metadata arrays of 32-bit values (token types, scores) */
     {T_STRS, 1, 1, "strs"},              /* metadata string arrays (tokens, merges) */
@@ -176,6 +183,7 @@ typedef struct {
     uint32_t code; const uint8_t *in, *end;
     const int16_t *stt;                       /* static value tables (cumulative, sum 2^12), or NULL */
     uint32_t *cnt; int cnt_only;              /* encoder: count values per context (pass 1) */
+    int bm_quick;                             /* byte model with orders 0 and 1 only (-q strings) */
 } Coder;
 
 /* The output buffer is allocated once at the segment's size. Output that reaches that size is
@@ -495,12 +503,12 @@ HOT void float_decode_impl(const uint8_t *in, size_t len, uint64_t n, const uint
         int sy = fl_search(T, slot);                                                            \
         uint32_t s0 = sy ? (uint32_t)T[sy - 1] : 0, f = (uint32_t)T[sy] - s0;                  \
         st = f * (st >> SM_BITS) + slot - s0;                                                     \
-        RANS_REFILL(st, p, end);                                                                \
+        if (nc) RANS_REFILL_NC(st, p); else RANS_REFILL(st, p, end);                            \
         (OUT) = sy; } while (0)
     /* symbol K: uniform with -q where fl_uni says so (16 slots of 256: the symbol is the slot's top) */
     #define FL_DSYMQ(K, CTX, OUT) do {                                                          \
         if (quick && fl_uni(type, K)) { uint32_t slot = st & (SM - 1); (OUT) = (int)(slot >> 8);  \
-            st = (SM / 16) * (st >> SM_BITS) + (slot & 255); RANS_REFILL(st, p, end); }         \
+            st = (SM / 16) * (st >> SM_BITS) + (slot & 255); if (nc) RANS_REFILL_NC(st, p); else RANS_REFILL(st, p, end); } \
         else FL_DSYM(CTX, OUT); } while (0)
     /* one value of lane L: its state and history in locals, so the 4 lanes are independent chains */
     #define FL_DVAL(L, I) do {                                                                  \
@@ -519,7 +527,11 @@ HOT void float_decode_impl(const uint8_t *in, size_t len, uint64_t n, const uint
     int pa0 = 0, pa1 = 0, pa2 = 0, pa3 = 0, pb0 = 0, pb1 = 0, pb2 = 0, pb3 = 0;
     (void)pa; (void)pb;
     uint64_t i = 0;
-    for (; i + 4 <= n; i += 4) { FL_DVAL(0, i); FL_DVAL(1, i + 1); FL_DVAL(2, i + 2); FL_DVAL(3, i + 3); }
+    for (; i + 4 <= n; i += 4) {                         /* 4 values take at most 64 bytes: then refills unchecked */
+        if (end - p >= 64) { const int nc = 1; FL_DVAL(0, i); FL_DVAL(1, i + 1); FL_DVAL(2, i + 2); FL_DVAL(3, i + 3); }
+        else { const int nc = 0; FL_DVAL(0, i); FL_DVAL(1, i + 1); FL_DVAL(2, i + 2); FL_DVAL(3, i + 3); }
+    }
+    const int nc = 0;
     if (i < n) { FL_DVAL(0, i); i++; }
     if (i < n) { FL_DVAL(1, i); i++; }
     if (i < n) { FL_DVAL(2, i); i++; }
@@ -555,6 +567,10 @@ static void float_code(Coder *c, uint8_t *data, uint64_t n, uint32_t type) {
 enum { KH_D = 0, KH_M = FL_HI, KH_SH = 2 * FL_HI, KH_SL = KH_SH + 64, KH_MH = KH_SL + 256, KH_ML = KH_MH + 1024,
        KH_CTX = KH_ML + 512, KH_N = 40 };
 static inline int kq_vctx(int bits) { return (bits == 4 ? 32 : 64) * 36; }
+/* -q Q4_K: values in pairs, a symbol of 256 (two adjacent values of a sub-block, the first in the low
+   nibble), given the zero point: KP_VCTX rows of 256, then the headers (16 of 256 used). Half the
+   rANS steps; on test data no larger, since the pairs' frequencies keep enough precision. */
+#define KP_VCTX 32
 static inline int kq_search(const int16_t *T, int k, uint32_t slot) {   /* number of cumulative counts <= slot */
 #ifdef SYM_VEC
     V8 vv = IOTA8 * 0 + (int16_t)slot, acc = IOTA8 * 0;
@@ -656,13 +672,15 @@ static void kq_hdr_syms(const uint8_t *B, const uint8_t *P, uint16_t *ctx, uint8
 static const uint8_t KQ_STEP[9][3] = {{0,3,1},{1,4,2},{2,5,2},{3,6,4},{4,7,5},{5,8,5},{6,6,7},{7,7,8},{8,8,8}};
 /* pass 1: count */
 static void kq_count(uint32_t *cnt, const uint8_t *data, uint64_t nblocks, int bits, int quick) {
-    int bs = bits == 4 ? 144 : 176, hb = kq_vctx(bits);
+    int bs = bits == 4 ? 144 : 176, pairs = quick && bits == 4, hb = pairs ? KP_VCTX : kq_vctx(bits);
+    size_t ks = pairs ? 256 : (size_t)1 << bits;
     for (uint64_t b = 0; b < nblocks; b++) {
         const uint8_t *B = data + b * bs; uint8_t q[256], hs[KH_N]; uint16_t ctx[256], hc[KH_N];
         kq_hdr_syms(B, b >= KQ_LANES ? B - KQ_LANES * bs : NULL, hc, hs);
-        for (int n = 0; n < KH_N; n++) cnt[((size_t)(hb + hc[n]) << bits) + hs[n]]++;
+        for (int n = 0; n < KH_N; n++) cnt[(size_t)(hb + hc[n]) * ks + hs[n]]++;
         k_unpack_vals(B, bits, q); kq_val_ctx(B, bits, q, ctx, quick);
-        for (int i = 0; i < 256; i++) cnt[((size_t)ctx[i] << bits) + q[i]]++;
+        if (pairs) for (int i = 0; i < 256; i += 2) cnt[(size_t)(ctx[i] / 36) * ks + (q[i] | (q[i + 1] << 4))]++;
+        else for (int i = 0; i < 256; i++) cnt[(size_t)ctx[i] * ks + q[i]]++;
     }
 }
 /* one rANS encoder step: symbol sy of table row T into state *x; 0 if the word buffer is full */
@@ -679,7 +697,7 @@ static inline int rans_put(uint32_t *x, const int16_t *T, int sy, uint16_t **wp,
    block); values: lane L takes sub-blocks L, L + KQ_LANES, ... of each block, value i of all
    lanes at once. */
 static size_t kq_lanes_encode(const uint8_t *data, uint64_t nblocks, int bits, int quick, const int16_t *U, uint8_t *out, size_t cap) {
-    int bs = bits == 4 ? 144 : 176, k = 1 << bits, hb = kq_vctx(bits); size_t head = 4 * KQ_LANES;
+    int bs = bits == 4 ? 144 : 176, pairs = quick && bits == 4, k = pairs ? 256 : 1 << bits, hb = pairs ? KP_VCTX : kq_vctx(bits); size_t head = 4 * KQ_LANES;
     if (cap < head + 2) return 0;
     size_t nw = (cap - head) / 2; uint16_t *w = xmalloc(nw * 2 + 2), *wp = w + nw;
     uint32_t x[KQ_LANES]; for (int L = 0; L < KQ_LANES; L++) x[L] = RANS_L;
@@ -688,7 +706,11 @@ static size_t kq_lanes_encode(const uint8_t *data, uint64_t nblocks, int bits, i
         for (int bi = nb - 1; bi >= 0; bi--) {             /* values, last block of the group first */
             const uint8_t *B = data + (b0 + bi) * bs; uint8_t q[256]; uint16_t ctx[256];
             k_unpack_vals(B, bits, q); kq_val_ctx(B, bits, q, ctx, quick);
-            for (int h = KQ_H - 1; h >= 0; h--) for (int i = 31; i >= 0; i--) for (int L = KQ_LANES - 1; L >= 0; L--) {
+            if (pairs) for (int h = KQ_H - 1; h >= 0; h--) for (int jp = 15; jp >= 0; jp--) for (int L = KQ_LANES - 1; L >= 0; L--) {
+                int idx = (KQ_LANES * h + L) * 32 + 2 * jp;
+                if (!rans_put(&x[L], U + (size_t)(ctx[idx] / 36) * k, q[idx] | (q[idx + 1] << 4), &wp, w)) { free(w); return 0; }
+            }
+            else for (int h = KQ_H - 1; h >= 0; h--) for (int i = 31; i >= 0; i--) for (int L = KQ_LANES - 1; L >= 0; L--) {
                 int idx = (KQ_LANES * h + L) * 32 + i;
                 if (!rans_put(&x[L], U + (size_t)ctx[idx] * k, q[idx], &wp, w)) { free(w); return 0; }
             }
@@ -707,7 +729,8 @@ static size_t kq_lanes_encode(const uint8_t *data, uint64_t nblocks, int bits, i
    Lt: Q5_K's value rows by lookup (with -DTENZ_LUT; NULL for Q4_K, whose 16-symbol rows are searched) */
 HOT void kq_lanes_decode_impl(const uint8_t *in, size_t len, uint8_t *data, uint64_t nblocks, const int bits, const int quick, const int16_t *U, const uint8_t *Lt) {
     const int bs = bits == 4 ? 144 : 176, k = 1 << bits, maxv = k - 1, zmax = bits == 4 ? 31 : 63;
-    const int16_t *UH = U + (size_t)kq_vctx(bits) * k;        /* header rows */
+    const int pairs = quick && bits == 4, ks = pairs ? 256 : k;   /* ks: the table rows' width */
+    const int16_t *UH = U + (size_t)(pairs ? KP_VCTX : kq_vctx(bits)) * ks;        /* header rows */
     const size_t head = 4 * KQ_LANES;
     if (len < head) die("corrupt file");
     uint32_t x[KQ_LANES]; for (int L = 0; L < KQ_LANES; L++) memcpy(&x[L], in + 4 * L, 4);
@@ -726,7 +749,7 @@ HOT void kq_lanes_decode_impl(const uint8_t *in, size_t len, uint8_t *data, uint
         st_ = f_ * (st_ >> SM_BITS) + slot_ - s0_;                                               \
         if (FAST) RANS_REFILL_NC(st_, p); else RANS_REFILL(st_, p, end);                         \
         x[L] = st_; (OUT) = sy_; } while (0)
-    #define KQ_HDR(L, CTX, MASK, OUT) do { int s_; KQ_GET(L, UH + (size_t)(CTX) * k, 16, s_); (OUT) = s_ & (MASK); } while (0)
+    #define KQ_HDR(L, CTX, MASK, OUT) do { int s_; KQ_GET(L, UH + (size_t)(CTX) * ks, 16, s_); (OUT) = s_ & (MASK); } while (0)
     #define KQ_F16(BASE, PA, PB, OUT) do { int a[KQ_LANES] = {0}, b_[KQ_LANES] = {0}, c_[KQ_LANES] = {0}, d_[KQ_LANES] = {0}; \
         for (int L = 0; L < nb; L++) KQ_HDR(L, (BASE) + PA[L], 15, a[L]);                        \
         for (int L = 0; L < nb; L++) KQ_HDR(L, (BASE) + 16 + ((a[L] << 4) | PB[L]), 15, b_[L]);  \
@@ -740,12 +763,12 @@ HOT void kq_lanes_decode_impl(const uint8_t *in, size_t len, uint8_t *data, uint
     uint8_t *FS = NULL;
     if (quick) {
         FS = xmalloc((size_t)(zmax + 1) * SM);
-        for (int z = 0; z <= zmax; z++) { const int16_t *T = U + (size_t)z * 36 * k; uint8_t *F = FS + (size_t)z * SM; int sy = 0;
-            for (int sl = 0; sl < SM; sl++) { while (sy < k - 1 && T[sy] <= sl) sy++; F[sl] = (uint8_t)sy; } }
+        for (int z = 0; z <= zmax; z++) { const int16_t *T = U + (size_t)z * (pairs ? 256 : 36 * k); uint8_t *F = FS + (size_t)z * SM; int sy = 0;
+            for (int sl = 0; sl < SM; sl++) { while (sy < ks - 1 && T[sy] <= sl) sy++; F[sl] = (uint8_t)sy; } }
     }
     /* FAST: at least 2 bytes per symbol left, so the refill needs no bound check */
     #define KQ_GETF(L, Z, OUT, FAST) do {                                                        \
-        const int16_t *T_ = U + (size_t)(Z) * 36 * k; uint32_t st_ = x[L], slot_ = st_ & (SM - 1); \
+        const int16_t *T_ = U + (size_t)(Z) * (pairs ? 256 : 36 * k); uint32_t st_ = x[L], slot_ = st_ & (SM - 1); \
         int sy_ = FS[(size_t)(Z) * SM + slot_];                                                  \
         uint32_t s0_ = sy_ ? (uint32_t)T_[sy_ - 1] : 0, f_ = (uint32_t)T_[sy_] - s0_;            \
         st_ = f_ * (st_ >> SM_BITS) + slot_ - s0_;                                               \
@@ -773,7 +796,18 @@ HOT void kq_lanes_decode_impl(const uint8_t *in, size_t len, uint8_t *data, uint
                 float z = step > 0 ? mf * (float)mn[bi][j] / step : 0.0f;
                 zb[j] = (z == z && z < 1e6f) ? clampi((int)rintf(z * 2.0f), 0, zmax) : 0;
             }
-            if (quick) for (int h = 0; h < KQ_H; h++) {
+            if (pairs) for (int h = 0; h < KQ_H; h++) {      /* -q Q4_K: two values per symbol */
+                int z[KQ_LANES];
+                for (int L = 0; L < KQ_LANES; L++) z[L] = zb[KQ_LANES * h + L];
+                if (end - p >= 2 * 16 * KQ_LANES) {
+                    for (int jp = 0; jp < 16; jp++) for (int L = 0; L < KQ_LANES; L++) {
+                        int sy, idx = (KQ_LANES * h + L) * 32 + 2 * jp; KQ_GETF(L, z[L], sy, 1); q[idx] = (uint8_t)(sy & 15); q[idx + 1] = (uint8_t)(sy >> 4);
+                    }
+                } else for (int jp = 0; jp < 16; jp++) for (int L = 0; L < KQ_LANES; L++) {
+                    int sy, idx = (KQ_LANES * h + L) * 32 + 2 * jp; KQ_GETF(L, z[L], sy, 0); q[idx] = (uint8_t)(sy & 15); q[idx + 1] = (uint8_t)(sy >> 4);
+                }
+            }
+            else if (quick) for (int h = 0; h < KQ_H; h++) {
                 int z[KQ_LANES];
                 for (int L = 0; L < KQ_LANES; L++) z[L] = zb[KQ_LANES * h + L];
                 if (end - p >= 2 * 32 * KQ_LANES) {          /* the common case: no bound checks */
@@ -812,6 +846,549 @@ static void kq_lanes_decode(const uint8_t *in, size_t len, uint8_t *data, uint64
 static void kq_code(Coder *c, uint8_t *data, uint64_t nblocks, int bits, int quick) {
     if (!c->dec && c->cnt_only) kq_count(c->cnt, data, nblocks, bits, quick);
     else die("internal: Q4_K and Q5_K are coded with kq_lanes_encode / kq_lanes_decode");
+}
+
+/* ---------------- -g: Q4_K in chunks a GPU can decode (OpenCL), or the CPU ---------------- */
+/* Experimental. A -g Q4_K segment is cut into chunks of C blocks (1024 by default); a chunk is decoded
+   by KQG_W = 64 lanes (a GPU work-group), each with its own rANS state, sharing one word stream: at
+   every step each lane decodes one symbol, then the lanes that need a word take the next ones in lane
+   order (a lane's word: the count of lanes before it that need one), so the lanes read neighbouring
+   words, which come through a ring in local memory loaded ahead. Steps, per group of 64 blocks: the
+   headers, lane L the header of block L of the group (40 symbols, as tenz's normal headers; history:
+   the lane's previous block, 64 back, none at the chunk start); then per block 4 steps, lanes 0..31
+   value L of sub-block 2 s, lanes 32..63 value L - 32 of sub-block 2 s + 1, each given only its
+   sub-block's zero point. The zero point is computed with multiplications that are exact in float and
+   comparisons only (no division, whose rounding a GPU need not follow): zb = the number of k in 0..30
+   with (2k + 1) d sc <= 4 dmin mn. Refills by subgroup scans where the GPU has subgroups (OpenCL 3.0
+   cl_khr_subgroups, any size dividing 64), otherwise by bits in local memory.
+   Layout: u32 chunks, u32 C, u32 KQG_W, u32 offsets[chunks + 1] (from the end of the offsets), then the
+   chunks: each its KQG_W final states (u32), then its 16-bit words in decoding order.
+   Measured on an Adreno 725 (Poco F5): kernels about 150 MiB/s of Q4_K, about the 3 big CPU cores with
+   -q, and 0.1 to 0.2 points less saved than -q; so for faster GPUs. The kernel is written once and
+   compiled both as OpenCL C and as C, where it runs on 64 threads with real barriers
+   (TENZ_KQG_KERNEL=1, for tests; TENZ_KQG_SG=n emulates subgroups of n, 0 none). */
+#define KQG_W 64
+#define KQG_R 256
+#define KQG_LM (6 + 3 * KQG_W)             /* the kernel's lm: masks, then per-subgroup totals */
+#define KQG_VCTX 32
+static int KQG_C = 1024;               /* compress: blocks per chunk (TENZ_GC=n); the file says it */
+#define __global
+#define __kernel
+#define __local
+#define uchar uint8_t
+#define ushort uint16_t
+#define uint uint32_t
+#define KQG_UNROLL
+#define KQG_VQ const
+#define KQG_OT uint8_t
+#define KQG_BS 144
+#define KQG_AI static inline __attribute__((always_inline))
+#define kqg_st(O, i, v) do { uint32_t v_ = (v); memcpy((O) + 4 * (i), &v_, 4); } while (0)
+#define kqg_ld16(P, k) kqg_ld16_((P), (k))
+static inline uint32_t kqg_ld16_(const uint8_t *p, uint32_t k) { uint16_t w; memcpy(&w, p + 2 * (size_t)k, 2); return w; }
+static inline float as_float_(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+#define as_float as_float_
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define popcount(x) ((uint32_t)__builtin_popcount(x))
+#define atomic_or(p, v) __atomic_fetch_or((p), (v), __ATOMIC_SEQ_CST)
+static __thread uint32_t kqg_lid, kqg_gid; static __thread pthread_barrier_t *kqg_barp;
+#define get_local_id(x) kqg_lid
+#define get_group_id(x) kqg_gid
+#define barrier(x) pthread_barrier_wait(kqg_barp)
+/* the emulator's subgroups (TENZ_KQG_SG: their size, a divisor of KQG_W; 0 tests the path without them) */
+static __thread uint32_t *kqg_scr; static uint32_t kqg_emu_sg = KQG_W;
+static uint32_t kqg_scan_(uint32_t v, int excl) {               /* exclusive scan (excl) or total within the subgroup */
+    kqg_scr[kqg_lid] = v; pthread_barrier_wait(kqg_barp);
+    uint32_t b = kqg_lid / kqg_emu_sg * kqg_emu_sg, r = 0, e = excl ? kqg_lid : b + kqg_emu_sg;
+    for (uint32_t i = b; i < e; i++) r += kqg_scr[i];
+    pthread_barrier_wait(kqg_barp); return r;
+}
+#define KQG_SCAN(v) kqg_scan_((v), 1)
+#define KQG_RED(v) kqg_scan_((v), 0)
+#define KQG_SGOK (kqg_emu_sg != 0)
+#define KQG_NSG (KQG_W / kqg_emu_sg)
+#define KQG_SGID (kqg_lid / kqg_emu_sg)
+#define KQG_SGLID (kqg_lid % kqg_emu_sg)
+#define KQG_KATTR
+#define KQG_CODE(...) __VA_ARGS__ static const char *KQG_SRC = #__VA_ARGS__;
+KQG_CODE(
+/* fp16 bits -> float, exact, with integer operations only; non-finite gives 0 (it never makes a zero point) */
+KQG_AI float kqg_h2f(uint h) {
+    uint s = (h >> 15) << 31, e = (h >> 10) & 31, m = h & 1023, b;
+    if (e == 31) return 0.0f;
+    if (e == 0) { if (!m) return as_float(s); e = 113; while (!(m & 1024)) { m <<= 1; e--; } m &= 1023; b = s | (e << 23) | (m << 13); }
+    else b = s | ((e + 112) << 23) | (m << 13);
+    return as_float(b);
+}
+KQG_AI int kqg_zb(uint dh, uint mh, int sc, int mn) {
+    float step = kqg_h2f(dh) * (float)sc, t = kqg_h2f(mh) * (float)mn * 4.0f; int z = 0;
+    if (!(step > 0.0f) || !(t > 0.0f)) return 0;
+    for (int k = 0; k < 31; k++) z += (float)(2 * k + 1) * step <= t;
+    return z;
+}
+/* one rANS step on a row of 16 cumulative counts, without the refill. No indexing by the symbol
+   (GPUs keep such arrays in slow memory): its start is the largest count <= slot, its end the smallest > slot */
+KQG_AI uint kqg_sym(uint *xp, __global const short *T) {
+    uint x = *xp, slot = x & 4095, sy = 0, lo = 0, hi = 4096;
+    KQG_UNROLL
+    for (int t = 0; t < 16; t++) { uint v = (uint)T[t], c = v <= slot; sy += c; lo = c ? v : lo; hi = c ? hi : min(hi, v); }
+    *xp = (hi - lo) * (x >> 12) + slot - lo; return sy;
+}
+KQG_AI uint kqg_syml(uint *xp, KQG_VQ short *T) {
+    uint x = *xp, slot = x & 4095, sy = 0, lo = 0, hi = 4096;
+    KQG_UNROLL
+    for (int t = 0; t < 16; t++) { uint v = (uint)T[t], c = v <= slot; sy += c; lo = c ? v : lo; hi = c ? hi : min(hi, v); }
+    *xp = (hi - lo) * (x >> 12) + slot - lo; return sy;
+}
+/* the refill, by all lanes together: each needing lane's word is the count of needing lanes before
+   it. With subgroups (sg: of equal size, together the KQG_W lanes) by the subgroups' scans, in lockstep,
+   plus, if there are several, the totals of the subgroups before (through local memory, a barrier);
+   otherwise by bits in local memory (three pairs of masks in turn, so one barrier per step: the pair cleared
+   now was last read before this step's barrier) */
+/* Input words come through a ring of KQG_R in local memory: the lanes load KQG_W words at once (one
+   each, neighbouring), started two loads ahead in registers (p0, p1), so a step waits for no global read */
+typedef struct { uint loaded, p0, p1; } KqgR;
+KQG_AI uint kqg_w(__global const uchar *wd, uint nw, uint k) { return k < nw ? (uint)kqg_ld16(wd, k) : 0u; }
+KQG_AI void kqg_fill(uint *xp, int act, __local uint *lm, __local uint *lr, KqgR *r, uint *tp, uint *pp, __global const uchar *wd, uint nw, uint L, int sg) {
+    uint x = *xp, need = act && x < 65536u, k, tot;
+    if (sg) {
+        k = KQG_SCAN(need); tot = KQG_RED(need);
+        uint ns = KQG_NSG;
+        if (ns > 1) {                                  /* rotating thirds: written at step t, read before step t + 1's barrier */
+            uint t = *tp, id = KQG_SGID; __local uint *ps = lm + 6 + KQG_W * (t % 3);
+            if (KQG_SGLID == 0) ps[id] = tot;
+            barrier(CLK_LOCAL_MEM_FENCE);
+            uint before = 0, all = 0;
+            for (uint i = 0; i < ns; i++) { uint v = ps[i]; before += i < id ? v : 0u; all += v; }
+            k += before; tot = all; *tp = t + 1;
+        }
+    }
+    else {
+        uint t = *tp; __local uint *m = lm + 2 * (t % 3);
+        if (need) atomic_or(m + (L >> 5), 1u << (L & 31));
+        barrier(CLK_LOCAL_MEM_FENCE);
+        uint m0 = m[0], m1 = m[1];
+        if (L == 0) { lm[2 * ((t + 2) % 3)] = 0; lm[2 * ((t + 2) % 3) + 1] = 0; }
+        k = L < 32 ? popcount(m0 & ((1u << L) - 1u)) : popcount(m0) + popcount(m1 & ((1u << (L - 32)) - 1u));
+        tot = popcount(m0) + popcount(m1); *tp = t + 1;
+    }
+    if (need) x = (x << 16) | lr[(*pp + k) & (KQG_R - 1)];
+    *pp += tot; *xp = x;
+    /* at least 2 KQG_W words ahead before every step (a step takes at most KQG_W); the slots written
+       now are past every unread one (at most 3 KQG_W - 1 unread or new, KQG_R = 4 KQG_W) */
+    if (r->loaded - *pp < 2 * KQG_W) {
+        lr[(r->loaded + L) & (KQG_R - 1)] = r->p0;
+        r->loaded += KQG_W; r->p0 = r->p1; r->p1 = kqg_w(wd, nw, r->loaded + KQG_W + L);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+}
+KQG_AI uint kqg_hs(uint *xp, int act, __global const short *T, __local uint *lm, __local uint *lr, KqgR *r, uint *tp, uint *pp, __global const uchar *wd, uint nw, uint L, int sg) {
+    uint s = act ? kqg_sym(xp, T) : 0u;
+    kqg_fill(xp, act, lm, lr, r, tp, pp, wd, nw, L, sg);
+    return s;
+}
+KQG_AI uint kqg_rd32(__global const uchar *p) { return (uint)p[0] | ((uint)p[1] << 8) | ((uint)p[2] << 16) | ((uint)p[3] << 24); }
+/* one chunk per work-group of KQG_W lanes. lm: 3 pairs of masks, lz: the group's zero points (2 words
+   per block), ls: one block's values (a word per lane), lV: the value rows, lr: the input ring. U: table set 11, rows of 16 cumulative
+   counts: KQG_VCTX value rows (by zero point), then the KH_CTX header rows. Output in 32-bit words
+   only (byte stores to global memory lost bytes on an Adreno). Bad input decodes wrong values or
+   nothing, never reads or writes outside the buffers. */
+__kernel KQG_KATTR void kqg_kernel(__global const uchar *body, uint len, uint nb, __global const short *U, __global KQG_OT *out,
+                         __local uint *lm, __local uint *lz, __local uint *ls, __local short *lV, __local uint *lr) {
+    uint L = (uint)get_local_id(0), c = (uint)get_group_id(0);
+    for (uint i = L; i < KQG_VCTX * 16; i += KQG_W) lV[i] = U[i];
+    for (uint i = L; i < KQG_LM; i += KQG_W) lm[i] = 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int sg = KQG_SGOK;                                 /* the same for all lanes */
+    if (len < 16) return;
+    uint nch = kqg_rd32(body), C = kqg_rd32(body + 4), W = kqg_rd32(body + 8);
+    if (W != KQG_W || !C || C > 65536 || c >= nch || nch > (len - 16) / 4 || c >= (nb + C - 1) / C) return;
+    uint base = 16 + 4 * nch, a = kqg_rd32(body + 12 + 4 * c), b = kqg_rd32(body + 16 + 4 * c);
+    if (a > b || b > len - base || b - a < 4 * KQG_W || ((b - a) & 1)) return;
+    __global const uchar *in = body + base + a, *wd = in + 4 * KQG_W;
+    uint x = kqg_rd32(in + 4 * L), nw = (b - a - 4 * KQG_W) / 2, pos = 0, t = 0;
+    uint first = c * C, n = nb - first < C ? nb - first : C;
+    __global KQG_OT *O = out + first * KQG_BS;
+    __global const short *H = U + KQG_VCTX * 16;
+    KqgR r; r.loaded = 2 * KQG_W;
+    lr[L] = kqg_w(wd, nw, L); lr[KQG_W + L] = kqg_w(wd, nw, KQG_W + L);
+    r.p0 = kqg_w(wd, nw, 2 * KQG_W + L); r.p1 = kqg_w(wd, nw, 3 * KQG_W + L);
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int pa = 0, pb = 0, ma = 0, mb = 0, psc = 0, pmn = 0;
+    for (uint g = 0; g * KQG_W < n; g++) {
+        uint blk = g * KQG_W + L; int act = blk < n;
+        uint a1 = kqg_hs(&x, act, H + pa * 16, lm, lr, &r, &t, &pos, wd, nw, L, sg) & 15;
+        uint b1 = kqg_hs(&x, act, H + (16 + (int)((a1 << 4) | (uint)pb)) * 16, lm, lr, &r, &t, &pos, wd, nw, L, sg) & 15;
+        uint c1 = kqg_hs(&x, act, H + (272 + (int)((a1 << 4) | b1)) * 16, lm, lr, &r, &t, &pos, wd, nw, L, sg) & 15;
+        uint d1 = kqg_hs(&x, act, H + (528 + (int)c1) * 16, lm, lr, &r, &t, &pos, wd, nw, L, sg) & 15;
+        uint a2 = kqg_hs(&x, act, H + (544 + ma) * 16, lm, lr, &r, &t, &pos, wd, nw, L, sg) & 15;
+        uint b2 = kqg_hs(&x, act, H + (560 + (int)((a2 << 4) | (uint)mb)) * 16, lm, lr, &r, &t, &pos, wd, nw, L, sg) & 15;
+        uint c2 = kqg_hs(&x, act, H + (816 + (int)((a2 << 4) | b2)) * 16, lm, lr, &r, &t, &pos, wd, nw, L, sg) & 15;
+        uint d2 = kqg_hs(&x, act, H + (1072 + (int)c2) * 16, lm, lr, &r, &t, &pos, wd, nw, L, sg) & 15;
+        uint d = (a1 << 12) | (b1 << 8) | (c1 << 4) | d1, dm = (a2 << 12) | (b2 << 8) | (c2 << 4) | d2;
+        pa = (int)a1; pb = (int)b1; ma = (int)a2; mb = (int)b2;
+        uint w1 = 0, w2 = 0, w3 = 0, z0 = 0, z1 = 0;
+        KQG_UNROLL
+        for (int j = 0; j < 8; j++) {
+            int sh = (int)(kqg_hs(&x, act, H + (1088 + psc) * 16, lm, lr, &r, &t, &pos, wd, nw, L, sg) & 3);
+            int s = (sh << 4) | (int)(kqg_hs(&x, act, H + (1152 + psc * 4 + sh) * 16, lm, lr, &r, &t, &pos, wd, nw, L, sg) & 15);
+            int mh = (int)(kqg_hs(&x, act, H + (1408 + s * 16 + (pmn >> 2)) * 16, lm, lr, &r, &t, &pos, wd, nw, L, sg) & 3);
+            int m = (mh << 4) | (int)(kqg_hs(&x, act, H + (2432 + (mh * 16 + (pmn >> 2)) * 8 + (s >> 3)) * 16, lm, lr, &r, &t, &pos, wd, nw, L, sg) & 15);
+            psc = s; pmn = m;
+            if (j < 4) { w1 |= (uint)s << (8 * j); w2 |= (uint)m << (8 * j); z0 |= (uint)kqg_zb(d, dm, s, m) << (8 * j); }
+            else { w1 |= (uint)(s >> 4) << (8 * (j - 4) + 6); w2 |= (uint)(m >> 4) << (8 * (j - 4) + 6);
+                   w3 |= (uint)((s & 15) | ((m & 15) << 4)) << (8 * (j - 4)); z1 |= (uint)kqg_zb(d, dm, s, m) << (8 * (j - 4)); }
+        }
+        if (act) { __global KQG_OT *B = O + blk * KQG_BS; kqg_st(B, 0, d | (dm << 16)); kqg_st(B, 1, w1); kqg_st(B, 2, w2); kqg_st(B, 3, w3); }
+        lz[2 * L] = z0; lz[2 * L + 1] = z1;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        uint ng = n - g * KQG_W < KQG_W ? n - g * KQG_W : KQG_W;
+        for (uint bb = 0; bb < ng; bb++) {
+            /* 4 steps: lanes 0..31 value L of sub-block 2 s, lanes 32..63 value L - 32 of sub-block 2 s + 1 */
+            uint za = lz[2 * bb], zc = lz[2 * bb + 1], nib = 0;
+            KQG_UNROLL
+            for (int s = 0; s < 4; s++) {
+                int sb = 2 * s + (int)(L >> 5);
+                uint zs = (sb < 4 ? za >> (8 * sb) : zc >> (8 * (sb - 4))) & 31;
+                uint sy = kqg_syml(&x, lV + zs * 16);
+                kqg_fill(&x, 1, lm, lr, &r, &t, &pos, wd, nw, L, sg);
+                nib |= (sy & 15) << (4 * s);
+            }
+            ls[L] = nib;
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if (L < 32) {                               /* word L of the values: pair j, values l0 .. l0 + 3 */
+                uint j = L >> 3, l0 = (L & 7) * 4, v = 0;
+                KQG_UNROLL
+                for (uint i = 0; i < 4; i++) v |= (((ls[l0 + i] >> (4 * j)) & 15) | (((ls[32 + l0 + i] >> (4 * j)) & 15) << 4)) << (8 * i);
+                kqg_st(O + (g * KQG_W + bb) * KQG_BS, 4 + L, v);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+}
+)
+#undef as_float
+#undef min
+#undef popcount
+#undef atomic_or
+#undef get_local_id
+#undef get_group_id
+#undef barrier
+#undef KQG_SCAN
+#undef KQG_RED
+#undef KQG_SGOK
+#undef KQG_NSG
+#undef KQG_SGID
+#undef KQG_SGLID
+#undef KQG_KATTR
+#undef __local
+#undef KQG_UNROLL
+#undef kqg_st
+#undef kqg_ld16
+#undef KQG_OT
+#undef KQG_BS
+#undef uchar
+#undef ushort
+#undef uint
+
+/* ---- the CPU's side ---- */
+static void kqg_ctx_block(const uint8_t *B, const uint8_t *P, uint16_t *hc, uint8_t *hs, uint8_t *q, uint8_t *z) {
+    int sc[8], mn[8]; kq_hdr_syms(B, P, hc, hs); k_unpack_scales(B + 4, sc, mn); k_unpack_vals(B, 4, q);
+    for (int s = 0; s < 8; s++) z[s] = (uint8_t)kqg_zb(rd16(B), rd16(B + 2), sc[s], mn[s]);
+}
+static void kqg_count(uint32_t *cnt, const uint8_t *data, uint64_t nb) {
+    for (uint64_t b = 0; b < nb; b++) {
+        const uint8_t *B = data + b * 144; uint8_t q[256], hs[KH_N], z[8]; uint16_t hc[KH_N];
+        kqg_ctx_block(B, b % KQG_C >= KQG_W ? B - KQG_W * 144 : NULL, hc, hs, q, z);
+        for (int n = 0; n < KH_N; n++) cnt[(size_t)(KQG_VCTX + hc[n]) * 16 + hs[n]]++;
+        for (int i = 0; i < 256; i++) cnt[(size_t)z[i >> 5] * 16 + q[i]]++;
+    }
+}
+/* the symbols of a chunk in the decoder's order, then rANS-coded backwards */
+typedef struct { uint8_t lane, sym; uint16_t row; } KqgSym;
+static size_t kqg_encode(const uint8_t *data, uint64_t nb, const int16_t *U, uint8_t *out, size_t cap) {
+    uint64_t nch = (nb + KQG_C - 1) / KQG_C; size_t base = 16 + 4 * nch, at = 0;
+    if (nch >= 0x3fffffffu || base > cap) return 0;
+    uint32_t v = (uint32_t)nch; memcpy(out, &v, 4); v = (uint32_t)KQG_C; memcpy(out + 4, &v, 4);
+    v = KQG_W; memcpy(out + 8, &v, 4); v = 0; memcpy(out + 12, &v, 4);
+    size_t ns = (size_t)KQG_C * (KH_N + 256), NW = ns + 8;
+    KqgSym *S = xmalloc(ns * sizeof *S); uint16_t *w = xmalloc(NW * 2);
+    uint16_t (*hc)[KH_N] = xmalloc((size_t)KQG_C * sizeof *hc); uint8_t (*hs)[KH_N] = xmalloc((size_t)KQG_C * sizeof *hs);
+    uint8_t (*q)[256] = xmalloc((size_t)KQG_C * 256), (*z)[8] = xmalloc((size_t)KQG_C * 8);
+    for (uint64_t c = 0; c < nch; c++) {
+        uint64_t b0 = c * KQG_C; int n = nb - b0 < (uint64_t)KQG_C ? (int)(nb - b0) : KQG_C; size_t k = 0;
+        for (int i = 0; i < n; i++) { const uint8_t *B = data + (b0 + i) * 144; kqg_ctx_block(B, i >= KQG_W ? B - KQG_W * 144 : NULL, hc[i], hs[i], q[i], z[i]); }
+        for (int g = 0; g * KQG_W < n; g++) {
+            int na = n - g * KQG_W < KQG_W ? n - g * KQG_W : KQG_W;
+            for (int h = 0; h < KH_N; h++) for (int L = 0; L < na; L++)
+                S[k++] = (KqgSym){ (uint8_t)L, hs[g * KQG_W + L][h], (uint16_t)(KQG_VCTX + hc[g * KQG_W + L][h]) };
+            for (int bb = 0; bb < na; bb++) for (int s = 0; s < 4; s++) for (int L = 0; L < KQG_W; L++) {
+                int sb = 2 * s + (L >> 5);
+                S[k++] = (KqgSym){ (uint8_t)L, q[g * KQG_W + bb][sb * 32 + (L & 31)], z[g * KQG_W + bb][sb] };
+            }
+        }
+        uint32_t x[KQG_W]; for (int L = 0; L < KQG_W; L++) x[L] = RANS_L;
+        uint16_t *wp = w + NW;
+        while (k-- > 0) if (!rans_put(&x[S[k].lane], U + (size_t)S[k].row * 16, S[k].sym, &wp, w)) die("internal: -g chunk");
+        size_t words = (size_t)(w + NW - wp), sz = 4 * KQG_W + 2 * words;
+        if (base + at + sz > cap) { at = SIZE_MAX; break; }
+        memcpy(out + base + at, x, 4 * KQG_W); memcpy(out + base + at + 4 * KQG_W, wp, 2 * words); at += sz;
+        v = (uint32_t)at; memcpy(out + 16 + 4 * c, &v, 4);
+    }
+    free(S); free(w); free(hc); free(hs); free(q); free(z);
+    return at == SIZE_MAX ? 0 : base + at;
+}
+/* the body's chunk count and size agree with the segment */
+static int kqg_shape_ok(const uint8_t *body, size_t len, uint64_t nb) {
+    uint32_t nch, C, W; if (len < 16) return 0;
+    memcpy(&nch, body, 4); memcpy(&C, body + 4, 4); memcpy(&W, body + 8, 4);
+    return W == KQG_W && C && C <= 65536 && (uint64_t)nch == (nb + C - 1) / C && 16 + 4 * (uint64_t)nch <= len && nb * 144 < 0xffffffffull;
+}
+/* the CPU's decoder: the kernel's steps with the lanes in a loop (same output), values by a slot -> symbol table */
+static void kqg_cpu(const uint8_t *body, size_t len, uint64_t nb, const int16_t *U, uint8_t *out) {
+    uint32_t nch, C; memcpy(&nch, body, 4); memcpy(&C, body + 4, 4);
+    uint8_t *FS = xmalloc((size_t)KQG_VCTX * SM);
+    for (int z = 0; z < KQG_VCTX; z++) { const int16_t *T = U + z * 16; uint8_t *F = FS + (size_t)z * SM; int sy = 0;
+        for (int sl = 0; sl < SM; sl++) { while (sy < 15 && T[sy] <= sl) sy++; F[sl] = (uint8_t)sy; } }
+    const short *H = U + KQG_VCTX * 16; size_t base = 16 + 4 * (size_t)nch;
+    memset(out, 0, nb * 144);
+    for (uint32_t c = 0; c < nch; c++) {
+        uint32_t a, b; memcpy(&a, body + 12 + 4 * c, 4); memcpy(&b, body + 16 + 4 * c, 4);
+        if (a > b || b > len - base || b - a < 4 * KQG_W || ((b - a) & 1)) die("corrupt file");
+        const uint8_t *in = body + base + a, *wd = in + 4 * KQG_W; uint32_t nw = (b - a - 4 * KQG_W) / 2, pos = 0;
+        uint32_t x[KQG_W]; memcpy(x, in, 4 * KQG_W);
+        uint64_t first = (uint64_t)c * C; uint32_t n = nb - first < C ? (uint32_t)(nb - first) : C;
+        int pa[KQG_W] = {0}, pb[KQG_W] = {0}, ma[KQG_W] = {0}, mb[KQG_W] = {0}, psc[KQG_W] = {0}, pmn[KQG_W] = {0};
+        #define KQG_REFILL(NA) for (int L = 0; L < (NA); L++) if (x[L] < 65536u) { x[L] = (x[L] << 16) | (pos < nw ? kqg_ld16_(wd, pos) : 0u); pos++; }
+        for (uint32_t g = 0; g * KQG_W < n; g++) {
+            int na = n - g * KQG_W < KQG_W ? (int)(n - g * KQG_W) : KQG_W;
+            int hv[KQG_W][KH_N], sc[KQG_W][8], mn[KQG_W][8];
+            for (int k = 0; k < KH_N; k++) {
+                for (int L = 0; L < na; L++) {
+                    int *h = hv[L], row;
+                    if (k < 8) {
+                        int bs = k < 4 ? 0 : 544, A = k < 4 ? pa[L] : ma[L], Bq = k < 4 ? pb[L] : mb[L], kk = k & 3;
+                        row = kk == 0 ? bs + A : kk == 1 ? bs + 16 + ((h[k - 1] << 4) | Bq) : kk == 2 ? bs + 272 + ((h[k - 2] << 4) | h[k - 1]) : bs + 528 + h[k - 1];
+                    } else {
+                        int j = (k - 8) >> 2, r = (k - 8) & 3, ps = j ? sc[L][j - 1] : psc[L], pm = j ? mn[L][j - 1] : pmn[L];
+                        row = r == 0 ? 1088 + ps : r == 1 ? 1152 + ps * 4 + h[k - 1] : r == 2 ? 1408 + sc[L][j] * 16 + (pm >> 2) : 2432 + (h[k - 1] * 16 + (pm >> 2)) * 8 + (sc[L][j] >> 3);
+                    }
+                    int sy = (int)kqg_sym(&x[L], H + row * 16), r = k >= 8 && !((k - 8) & 1) ? sy & 3 : sy & 15;
+                    h[k] = r;
+                    if (k >= 8) { int j = (k - 8) >> 2, rr = (k - 8) & 3; if (rr == 1) sc[L][j] = (h[k - 1] << 4) | r; if (rr == 3) mn[L][j] = (h[k - 1] << 4) | r; }
+                }
+                KQG_REFILL(na)
+            }
+            uint8_t zb[KQG_W][8];
+            for (int L = 0; L < na; L++) {
+                int *h = hv[L]; uint8_t *B = out + (first + g * KQG_W + L) * 144;
+                uint16_t d = (uint16_t)((h[0] << 12) | (h[1] << 8) | (h[2] << 4) | h[3]), dm = (uint16_t)((h[4] << 12) | (h[5] << 8) | (h[6] << 4) | h[7]);
+                pa[L] = h[0]; pb[L] = h[1]; ma[L] = h[4]; mb[L] = h[5]; psc[L] = sc[L][7]; pmn[L] = mn[L][7];
+                wr16(B, d); wr16(B + 2, dm); k_pack_scales(B + 4, sc[L], mn[L]);
+                for (int s = 0; s < 8; s++) zb[L][s] = (uint8_t)kqg_zb(d, dm, sc[L][s], mn[L][s]);
+            }
+            for (int bb = 0; bb < na; bb++) {
+                uint8_t q[256];
+                for (int s = 0; s < 4; s++) {
+                    for (int L = 0; L < KQG_W; L++) {
+                        int sb = 2 * s + (L >> 5), z = zb[bb][sb]; const int16_t *T = U + z * 16;
+                        uint32_t st = x[L], slot = st & (SM - 1); int sy = FS[(size_t)z * SM + slot];
+                        uint32_t s0 = sy ? (uint32_t)T[sy - 1] : 0, f = (uint32_t)T[sy] - s0;
+                        x[L] = f * (st >> SM_BITS) + slot - s0; q[sb * 32 + (L & 31)] = (uint8_t)sy;
+                    }
+                    KQG_REFILL(KQG_W)
+                }
+                k_pack_vals(out + (first + g * KQG_W + bb) * 144, 4, q);
+            }
+        }
+        #undef KQG_REFILL
+    }
+    free(FS);
+}
+/* the kernel's own code on the CPU: 32 threads per chunk with real barriers (TENZ_KQG_KERNEL=1, tests only) */
+typedef struct { const uint8_t *body; uint32_t len, nb, nch, lane; const int16_t *U; uint8_t *out; uint32_t *lm, *lz, *ls, *scr; int16_t *lV; uint32_t *lr; pthread_barrier_t *bar; } KqgEmu;
+static void *kqg_emu_lane(void *arg) {
+    KqgEmu *e = arg; kqg_lid = e->lane; kqg_barp = e->bar; kqg_scr = e->scr;
+    for (uint32_t c = 0; c < e->nch; c++) { kqg_gid = c; kqg_kernel(e->body, e->len, e->nb, e->U, e->out, e->lm, e->lz, e->ls, e->lV, e->lr); pthread_barrier_wait(e->bar); }
+    return NULL;
+}
+static void kqg_emulate(const uint8_t *body, size_t len, uint64_t nb, const int16_t *U, uint8_t *out) {
+    uint32_t nch; memcpy(&nch, body, 4);
+    uint32_t lm[KQG_LM], lz[2 * KQG_W], ls[KQG_W], scr[KQG_W], lr[KQG_R]; int16_t lV[KQG_VCTX * 16];
+    { const char *e = getenv("TENZ_KQG_SG"); int v = e ? atoi(e) : KQG_W; kqg_emu_sg = v > 0 && KQG_W % v == 0 ? (uint32_t)v : 0; } pthread_barrier_t bar; pthread_barrier_init(&bar, NULL, KQG_W);
+    KqgEmu e[KQG_W]; pthread_t th[KQG_W];
+    memset(out, 0, nb * 144);
+    for (int L = 0; L < KQG_W; L++) { e[L] = (KqgEmu){ body, (uint32_t)len, (uint32_t)nb, nch, (uint32_t)L, U, out, lm, lz, ls, scr, lV, lr, &bar };
+                                      pthread_create(&th[L], NULL, kqg_emu_lane, &e[L]); }
+    for (int L = 0; L < KQG_W; L++) pthread_join(th[L], NULL);
+    pthread_barrier_destroy(&bar);
+}
+
+/* ---- OpenCL, loaded at run time (no build dependency): libOpenCL.so, as Termux / Android have it
+   (LD_LIBRARY_PATH=... if it is not found). TENZ_GPU=0: CPU only; 2: every -g segment on the GPU.
+   Each thread has its own queue and kernel, so segments go to the GPU in parallel; at most
+   TENZ_GPU_N (2) at once by default, the rest decode on the CPU. Any failure: the CPU decodes
+   (same output). The first GPU segment is always checked against the CPU. */
+#include <dlfcn.h>
+typedef int32_t cl_int; typedef uint32_t cl_uint; typedef uint64_t cl_ulong, cl_bitfield;
+typedef void *cl_platform_id, *cl_device_id, *cl_context, *cl_command_queue, *cl_mem, *cl_program, *cl_kernel, *cl_event;
+static struct {
+    cl_int (*GetPlatformIDs)(cl_uint, cl_platform_id *, cl_uint *);
+    cl_int (*GetDeviceIDs)(cl_platform_id, cl_bitfield, cl_uint, cl_device_id *, cl_uint *);
+    cl_int (*GetDeviceInfo)(cl_device_id, cl_uint, size_t, void *, size_t *);
+    cl_context (*CreateContext)(const intptr_t *, cl_uint, const cl_device_id *, void *, void *, cl_int *);
+    cl_command_queue (*CreateCommandQueue)(cl_context, cl_device_id, cl_bitfield, cl_int *);
+    cl_program (*CreateProgramWithSource)(cl_context, cl_uint, const char **, const size_t *, cl_int *);
+    cl_int (*BuildProgram)(cl_program, cl_uint, const cl_device_id *, const char *, void *, void *);
+    cl_int (*GetProgramBuildInfo)(cl_program, cl_device_id, cl_uint, size_t, void *, size_t *);
+    cl_kernel (*CreateKernel)(cl_program, const char *, cl_int *);
+    cl_mem (*CreateBuffer)(cl_context, cl_bitfield, size_t, void *, cl_int *);
+    cl_int (*SetKernelArg)(cl_kernel, cl_uint, size_t, const void *);
+    cl_int (*EnqueueNDRangeKernel)(cl_command_queue, cl_kernel, cl_uint, const size_t *, const size_t *, const size_t *, cl_uint, const cl_event *, cl_event *);
+    cl_int (*EnqueueReadBuffer)(cl_command_queue, cl_mem, cl_uint, size_t, size_t, void *, cl_uint, const cl_event *, cl_event *);
+    cl_int (*ReleaseMemObject)(cl_mem);
+    cl_int (*Finish)(cl_command_queue);
+    cl_context ctx; cl_program prog; cl_device_id dev;
+    int state, checked, inflight, maxn;  /* state: 0 not tried, 1 ready, -1 none; checked: first segment compared with the CPU */
+    pthread_mutex_t mu;
+    double secs, ksecs; uint64_t segs, chunks, chksegs, badsegs, cpusegs;   /* summed over segments: GPU time, kernels alone */
+} G = { .mu = PTHREAD_MUTEX_INITIALIZER };
+static int gpu_init(void) {
+    const char *e = getenv("TENZ_GPU"); if (e && e[0] == '0') return -1;
+    const char *names[] = { "libOpenCL.so", "libOpenCL.so.1", "/vendor/lib64/libOpenCL.so", "/system/vendor/lib64/libOpenCL.so", NULL };
+    void *h = NULL; for (int i = 0; names[i] && !h; i++) h = dlopen(names[i], RTLD_NOW | RTLD_LOCAL);
+    if (!h) { fprintf(stderr, "gpu: no libOpenCL.so (set LD_LIBRARY_PATH), decoding on the CPU\n"); return -1; }
+    #define LD(f) if (!(*(void **)&G.f = dlsym(h, "cl" #f))) { fprintf(stderr, "gpu: cl" #f " missing\n"); return -1; }
+    LD(GetPlatformIDs) LD(GetDeviceIDs) LD(GetDeviceInfo) LD(CreateContext) LD(CreateCommandQueue) LD(CreateProgramWithSource)
+    LD(BuildProgram) LD(GetProgramBuildInfo) LD(CreateKernel) LD(CreateBuffer) LD(SetKernelArg) LD(EnqueueNDRangeKernel)
+    LD(EnqueueReadBuffer) LD(ReleaseMemObject) LD(Finish)
+    #undef LD
+    cl_platform_id pl[8]; cl_uint np = 0; cl_int err;
+    if (G.GetPlatformIDs(8, pl, &np) || !np) { fprintf(stderr, "gpu: no OpenCL platform\n"); return -1; }
+    int found = 0;
+    for (cl_uint i = 0; i < np && !found; i++) { cl_uint nd = 0; found = !G.GetDeviceIDs(pl[i], 1u << 2, 1, &G.dev, &nd) && nd; }
+    if (!found) { fprintf(stderr, "gpu: no OpenCL GPU\n"); return -1; }
+    char name[256] = {0}; G.GetDeviceInfo(G.dev, 0x102B, sizeof name - 1, name, NULL);   /* CL_DEVICE_NAME */
+    G.ctx = G.CreateContext(NULL, 1, &G.dev, NULL, NULL, &err); if (!G.ctx) return -1;
+    /* builds, best first: OpenCL 3.0 with subgroups and Qualcomm's fixed subgroup size, then without
+       the size, then OpenCL 1.2 without subgroups (the kernel's refills by local memory).
+       TENZ_GPU_SG: "full" asks Qualcomm for 128-wide subgroups instead of 64 ("half"), "0" skips subgroups */
+    const char *un = getenv("TENZ_GPU_UNROLL"), *sge = getenv("TENZ_GPU_SG"), *eo = getenv("TENZ_GPU_OPTS");
+    static const char *SGPRE = "#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n#define KQG_SCAN(v) sub_group_scan_exclusive_add(v)\n"
+                               "#define KQG_RED(v) sub_group_reduce_add(v)\n#define KQG_SGOK (get_sub_group_size() * get_num_sub_groups() == KQG_W && get_max_sub_group_size() == get_sub_group_size())\n"
+                               "#define KQG_NSG get_num_sub_groups()\n#define KQG_SGID get_sub_group_id()\n#define KQG_SGLID get_sub_group_local_id()\n";
+    static const char *NOSG = "#define KQG_SCAN(v) 0u\n#define KQG_RED(v) 0u\n#define KQG_SGOK 0\n#define KQG_NSG 1u\n#define KQG_SGID 0u\n#define KQG_SGLID 0u\n";
+    char attr[160];
+    snprintf(attr, sizeof attr, "#define KQG_KATTR __attribute__((reqd_work_group_size(KQG_W, 1, 1))) __attribute__((qcom_reqd_sub_group_size(\"%s\")))\n",
+             sge && !strcmp(sge, "full") ? "full" : "half");
+    struct { const char *std, *sg, *attr, *what; } V[3] = {
+        { "-cl-std=CL3.0", SGPRE, attr, "subgroups, Qualcomm subgroup size" },
+        { "-cl-std=CL3.0", SGPRE, "#define KQG_KATTR __attribute__((reqd_work_group_size(KQG_W, 1, 1)))\n", "subgroups" },
+        { "-cl-std=CL1.2", NOSG, "#define KQG_KATTR __attribute__((reqd_work_group_size(KQG_W, 1, 1)))\n", "no subgroups" } };
+    int v0 = sge && sge[0] == '0' ? 2 : 0, built = -1; char opts[512] = "";
+    for (int v = v0; v < 3 && built < 0; v++) {
+        size_t sl = strlen(KQG_SRC) + 2048; char *src = xmalloc(sl);
+        snprintf(src, sl, "#pragma OPENCL FP_CONTRACT OFF\n%s#define KQG_UNROLL %s\n#define KQG_W %d\n#define KQG_R %d\n#define KQG_VCTX 32\n#define KQG_VQ __local const\n"
+                 "#define KQG_OT uint\n#define KQG_BS 36\n#define KQG_AI static inline __attribute__((always_inline))\n#define kqg_st(O, i, v) ((O)[i] = (v))\n"
+                 "#define kqg_ld16(P, k) (((__global const ushort *)(P))[k])\n#define KQG_LM (6 + 3 * KQG_W)\n%s%s\n", V[v].sg, un && un[0] == '0' ? "" : "_Pragma(\"unroll\")", KQG_W, KQG_R, V[v].attr, KQG_SRC);
+        const char *sp = src; G.prog = G.CreateProgramWithSource(G.ctx, 1, &sp, NULL, &err); free(src);
+        if (!G.prog) return -1;
+        snprintf(opts, sizeof opts, "%s %s", V[v].std, eo ? eo : "");
+        if (!G.BuildProgram(G.prog, 1, &G.dev, opts, NULL, NULL)) { built = v; break; }
+        /* a build that fails is reported only if every one fails (or TENZ_GPU_LOG=1) */
+        static char log[3][4096]; G.GetProgramBuildInfo(G.prog, G.dev, 0x1183, sizeof log[v] - 1, log[v], NULL);
+        const char *lg = getenv("TENZ_GPU_LOG");
+        if ((lg && lg[0] == '1') || v == 2) for (int u = (lg && lg[0] == '1') ? v : v0; u <= v; u++)
+            fprintf(stderr, "gpu: kernel build with %s failed:\n%.*s\n", V[u].what, 1500, log[u]);
+    }
+    if (built < 0) return -1;
+    /* the subgroup size the kernel gets (OpenCL 2.1+; the kernel checks it itself, this is for the log) */
+    size_t sgs = 0;
+    { cl_int (*SGI)(cl_kernel, cl_device_id, cl_uint, size_t, const void *, size_t, void *, size_t *);
+      *(void **)&SGI = dlsym(h, "clGetKernelSubGroupInfo");
+      cl_kernel k = G.CreateKernel(G.prog, "kqg_kernel", &err); size_t loc = KQG_W;
+      if (SGI && k && SGI(k, G.dev, 0x2033, sizeof loc, &loc, sizeof sgs, &sgs, NULL)) sgs = 0; }
+    const char *n = getenv("TENZ_GPU_N"); G.maxn = n && atoi(n) > 0 ? atoi(n) : 2;
+    if (e && e[0] == '2') G.maxn = 1 << 30;
+    printf("gpu: %s (OpenCL), decoding -g segments, up to %d at once [%s, %s, subgroup size %d%s%s]\n", name, G.maxn > 1000 ? 999 : G.maxn, opts,
+           V[built].what, (int)sgs, built < 2 && sgs && KQG_W % sgs == 0 ? (sgs == KQG_W ? ": refills by subgroup scan" : ": refills by subgroup scans") : built < 2 && sgs ? ": refills by local memory" : "", un && un[0] == '0' ? ", no unroll" : "");
+    return 1;
+}
+/* decode one -g segment on the GPU; 0 if it could not (the caller decodes on the CPU) */
+static int gpu_decode(const uint8_t *body, size_t len, uint64_t nb, const int16_t *U, uint8_t *out) {
+    static __thread cl_command_queue tq; static __thread cl_kernel tk;
+    pthread_mutex_lock(&G.mu);
+    if (!G.state) G.state = gpu_init();
+    int go = G.state > 0 && G.inflight < G.maxn;
+    if (go && !tk) {
+        cl_int e1 = 0, e2 = 0; tq = G.CreateCommandQueue(G.ctx, G.dev, 0, &e1); tk = G.CreateKernel(G.prog, "kqg_kernel", &e2);
+        if (!tq || !tk) { fprintf(stderr, "gpu: no queue or kernel (%d %d)\n", (int)e1, (int)e2); G.state = -1; go = 0; }
+    }
+    if (go) G.inflight++; else if (G.state > 0) G.cpusegs++;
+    pthread_mutex_unlock(&G.mu);
+    if (!go) return 0;
+    double t0 = now(), t1 = t0, t2 = t0; cl_int err = 0; int ok = 0;
+    uint32_t nch; memcpy(&nch, body, 4);
+    size_t ub = (size_t)(KQG_VCTX + KH_CTX) * 16 * 2, ob = (size_t)nb * 144;
+    cl_mem mb = G.CreateBuffer(G.ctx, (1u << 2) | (1u << 5), len, (void *)body, &err);
+    cl_mem mu = G.CreateBuffer(G.ctx, (1u << 2) | (1u << 5), ub, (void *)U, &err);
+    cl_mem mo = G.CreateBuffer(G.ctx, 1u << 1, ob ? ob : 4, NULL, &err);
+    if (mb && mu && mo) {
+        cl_uint l = (cl_uint)len, n = (cl_uint)nb; size_t loc = KQG_W, gl = (size_t)nch * KQG_W;
+        err  = G.SetKernelArg(tk, 0, sizeof mb, &mb); err |= G.SetKernelArg(tk, 1, 4, &l); err |= G.SetKernelArg(tk, 2, 4, &n);
+        err |= G.SetKernelArg(tk, 3, sizeof mu, &mu); err |= G.SetKernelArg(tk, 4, sizeof mo, &mo);
+        err |= G.SetKernelArg(tk, 5, KQG_LM * 4, NULL); err |= G.SetKernelArg(tk, 6, 2 * KQG_W * 4, NULL);
+        err |= G.SetKernelArg(tk, 7, KQG_W * 4, NULL); err |= G.SetKernelArg(tk, 8, KQG_VCTX * 16 * 2, NULL); err |= G.SetKernelArg(tk, 9, KQG_R * 4, NULL);
+        G.Finish(tq); t1 = now();
+        if (!err && gl) err = G.EnqueueNDRangeKernel(tq, tk, 1, NULL, &gl, &loc, 0, NULL, NULL);
+        if (!err) err = G.Finish(tq);
+        t2 = now();
+        if (!err && ob) err = G.EnqueueReadBuffer(tq, mo, 1, 0, ob, out, 0, NULL, NULL);
+        ok = !err;
+        if (err) fprintf(stderr, "gpu: OpenCL error %d, decoding on the CPU\n", (int)err);
+    } else fprintf(stderr, "gpu: no buffers (%d), decoding on the CPU\n", (int)err);
+    if (mb) G.ReleaseMemObject(mb);
+    if (mu) G.ReleaseMemObject(mu);
+    if (mo) G.ReleaseMemObject(mo);
+    pthread_mutex_lock(&G.mu);
+    G.inflight--;
+    if (!ok) G.state = -1; else { G.secs += now() - t0; G.ksecs += t2 - t1; G.segs++; G.chunks += nch; }
+    pthread_mutex_unlock(&G.mu);
+    return ok;
+}
+static void kqg_decode(const uint8_t *body, size_t len, uint64_t nb, const int16_t *U, uint8_t *out) {
+    if (!kqg_shape_ok(body, len, nb)) die("corrupt file");
+    static int emu = -1; if (emu < 0) { const char *e = getenv("TENZ_KQG_KERNEL"); emu = e && e[0] == '1'; }
+    if (emu) { kqg_emulate(body, len, nb, U, out); return; }
+    if (!gpu_decode(body, len, nb, U, out)) { kqg_cpu(body, len, nb, U, out); return; }
+    /* the first GPU segment is always checked against the CPU: a GPU or driver that decodes
+       differently is then not used; TENZ_GPU_CHECK=1 checks every one */
+    static int check = -1; if (check < 0) { const char *e = getenv("TENZ_GPU_CHECK"); check = e && e[0] == '1'; }
+    if (!check && __atomic_exchange_n(&G.checked, 1, __ATOMIC_ACQ_REL)) return;
+    uint8_t *ref = xmalloc(nb * 144); kqg_cpu(body, len, nb, U, ref);
+    uint32_t C; memcpy(&C, body + 4, 4);
+    uint64_t bad = 0, first = 0; int where[3] = {0, 0, 0};   /* d/dmin, scales, values */
+    for (uint64_t b = 0; b < nb; b++) {
+        const uint8_t *g = out + b * 144, *r = ref + b * 144; if (!memcmp(g, r, 144)) continue;
+        if (!bad) first = b;
+        bad++; where[0] += !!memcmp(g, r, 4); where[1] += !!memcmp(g + 4, r + 4, 12); where[2] += !!memcmp(g + 16, r + 16, 128);
+    }
+    pthread_mutex_lock(&G.mu);
+    if (bad && !check) { G.state = -1; fprintf(stderr, "\ngpu: its output differs from the CPU's, decoding on the CPU (TENZ_GPU_CHECK=1 shows where)\n"); }
+    else if (bad) {
+        G.badsegs++;
+        int fo = 0; while (out[first * 144 + fo] == ref[first * 144 + fo]) fo++;
+        fprintf(stderr, "\ngpu check: %" PRIu64 " of %" PRIu64 " blocks differ (d/dmin %d, scales %d, values %d); first: chunk %" PRIu64 " block %" PRIu64 " byte %d (gpu %02x, cpu %02x)\n",
+                bad, nb, where[0], where[1], where[2], first / C, first % C, fo, out[first * 144 + fo], ref[first * 144 + fo]);
+        static int dumped; if (!dumped++) for (int r = 0; r < 2; r++) {
+            const uint8_t *q = (r ? ref : out) + first * 144; fprintf(stderr, "%s:", r ? "cpu" : "gpu");
+            for (int i = 0; i < 144; i++) fprintf(stderr, "%s%02x", i % 16 ? "" : " ", q[i]);
+            fprintf(stderr, "\n");
+        }
+    }
+    G.chksegs++;
+    pthread_mutex_unlock(&G.mu);
+    memcpy(out, ref, nb * 144); free(ref);
 }
 
 /* ---------------- Q4_0 in rANS lanes ---------------- */
@@ -914,6 +1491,19 @@ typedef struct { uint32_t x[4]; const uint8_t *p, *end; } RansDec;
     st_ = f_ * (st_ >> SM_BITS) + slot_ - s0_;                                                       \
     RANS_REFILL(st_, (D)->p, (D)->end);                                                              \
     (D)->x[L] = st_; (OUT) = sy_; } while (0)
+/* RD_GET when at least 2 bytes of input are known to be left */
+#define RD_GET_NC(D, L, ROW, OUT) do {                                                               \
+    const int16_t *T_ = (ROW); uint32_t st_ = (D)->x[L], slot_ = st_ & (SM - 1); int sy_ = kq_search(T_, 16, slot_); \
+    uint32_t s0_ = sy_ ? (uint32_t)T_[sy_ - 1] : 0, f_ = (uint32_t)T_[sy_] - s0_;                    \
+    st_ = f_ * (st_ >> SM_BITS) + slot_ - s0_;                                                       \
+    RANS_REFILL_NC(st_, (D)->p);                                                                     \
+    (D)->x[L] = st_; (OUT) = sy_; } while (0)
+#define RD_GETT_NC(D, L, ROW, F, OUT) do {                                                           \
+    const int16_t *T_ = (ROW); uint32_t st_ = (D)->x[L], slot_ = st_ & (SM - 1); int sy_ = (F)[slot_]; \
+    uint32_t s0_ = sy_ ? (uint32_t)T_[sy_ - 1] : 0, f_ = (uint32_t)T_[sy_] - s0_;                    \
+    st_ = f_ * (st_ >> SM_BITS) + slot_ - s0_;                                                       \
+    RANS_REFILL_NC(st_, (D)->p);                                                                     \
+    (D)->x[L] = st_; (OUT) = sy_; } while (0)
 /* the same from row ROW by its full slot table F (-q) */
 #define RD_GETT(D, L, ROW, F, OUT) do {                                                              \
     const int16_t *T_ = (ROW); uint32_t st_ = (D)->x[L], slot_ = st_ & (SM - 1); int sy_ = (F)[slot_]; \
@@ -935,14 +1525,23 @@ static inline __attribute__((always_inline)) void q40_dgroup(RansDec *D, uint8_t
         d[L] = (uint16_t)((a[L] << 12) | (bn[L] << 8) | (cn[L] << 4) | dn[L]); pa[L] = a[L]; pb[L] = bn[L];
         ds[L] = sgn16(d[L]); inv[L] = q40_inv((b0 + L) / bpr); c0[L] = (b0 + L) % bpr * 32;
     }
-    if (quick) for (int i = 0; i < 32; i++) for (int L = 0; L < n; L++) {   /* -q: a row per bucket and position */
-        int cb = q40_cb(P[c0[L] + i], inv[L], ds[L]), sy; RD_GETT(D, L, U + (size_t)(cb + (i >> 3)) * 16, FS + (size_t)((cb >> 6) * 4 + (i >> 3)) * SM, sy);
-        q[L][i] = (uint8_t)sy;
-    }
-    else for (int i = 0; i < 32; i++) for (int L = 0; L < n; L++) {
-        int sy; RD_GET(D, L, U + (size_t)q40_ctx1(P, c0[L] + i, inv[L], ds[L], seen[L], sa[L], i) * 16, sy);
-        q[L][i] = (uint8_t)sy; seen[L] |= sy == 0; sa[L] += sy < 8 ? 8 - sy : sy - 8;
-    }
+    /* the column buckets are those at the start of the group: all of them first, then the values */
+    uint16_t cbv[4][32];
+    for (int L = 0; L < n; L++) for (int i = 0; i < 32; i++) cbv[L][i] = (uint16_t)q40_cb(P[c0[L] + i], inv[L], ds[L]);
+    const int fast = D->end - D->p >= 2 * 32 * 4;       /* enough input for every value: refills unchecked */
+    #define Q40_VALS(NC) do {                                                                        \
+        if (quick) for (int i = 0; i < 32; i++) for (int L = 0; L < n; L++) {   /* -q: a row per bucket and position */ \
+            int cb = cbv[L][i], sy; const int16_t *R_ = U + (size_t)(cb + (i >> 3)) * 16; const uint8_t *F_ = FS + (size_t)((cb >> 6) * 4 + (i >> 3)) * SM; \
+            if (NC) RD_GETT_NC(D, L, R_, F_, sy); else RD_GETT(D, L, R_, F_, sy);                         \
+            q[L][i] = (uint8_t)sy;                                                                     \
+        }                                                                                              \
+        else for (int i = 0; i < 32; i++) for (int L = 0; L < n; L++) {                                \
+            int sy; const int16_t *R_ = U + (size_t)(cbv[L][i] + seen[L] * 32 + Q40_AV[i][sa[L]]) * 16; \
+            if (NC) RD_GET_NC(D, L, R_, sy); else RD_GET(D, L, R_, sy);                                \
+            q[L][i] = (uint8_t)sy; seen[L] |= sy == 0; sa[L] += sy < 8 ? 8 - sy : sy - 8;              \
+        } } while (0)
+    if (fast) Q40_VALS(1); else Q40_VALS(0);
+    #undef Q40_VALS
     for (int L = 0; L < n; L++) {
         uint8_t *B = data + (b0 + L) * 18; wr16(B, d[L]);
         for (int j = 0; j < 16; j++) B[2 + j] = (uint8_t)(q[L][j] | (q[L][16 + j] << 4));
@@ -951,12 +1550,13 @@ static inline __attribute__((always_inline)) void q40_dgroup(RansDec *D, uint8_t
 }
 /* decode; corrupt input gives wrong values, never reads outside in[0..len) */
 /* -q: a full slot -> symbol table for each of n rows (row r at U + rowof(r) * 16) */
-static uint8_t *slot_tables(const int16_t *U, int n, int (*rowof)(int)) {
+static uint8_t *slot_tables_k(const int16_t *U, int n, int (*rowof)(int), int k) {   /* rows of k symbols */
     uint8_t *FS = xmalloc((size_t)n * SM);
-    for (int r = 0; r < n; r++) { const int16_t *T = U + (size_t)rowof(r) * 16; uint8_t *F = FS + (size_t)r * SM; int sy = 0;
-        for (int sl = 0; sl < SM; sl++) { while (sy < 15 && T[sy] <= sl) sy++; F[sl] = (uint8_t)sy; } }
+    for (int r = 0; r < n; r++) { const int16_t *T = U + (size_t)rowof(r) * k; uint8_t *F = FS + (size_t)r * SM; int sy = 0;
+        for (int sl = 0; sl < SM; sl++) { while (sy < k - 1 && T[sy] <= sl) sy++; F[sl] = (uint8_t)sy; } }
     return FS;
 }
+static uint8_t *slot_tables(const int16_t *U, int n, int (*rowof)(int)) { return slot_tables_k(U, n, rowof, 16); }
 static int q40_qrow(int r) { return (r >> 2) * 64 + (r & 3); }
 HOT void q40_decode(const uint8_t *in, size_t len, uint8_t *data, uint64_t rows, uint64_t ne0, const int16_t *U, int quick) {
     if (len < 16) die("corrupt file");
@@ -1103,19 +1703,30 @@ static inline __attribute__((always_inline)) void q80_dgroup(RansDec *D, uint8_t
         wr16(data + (b0 + L) * 34, d);
         ds[L] = sgn16(d); inv[L] = q40_inv((b0 + L) / bpr); c0[L] = (b0 + L) % bpr * 32;
     }
-    for (int i = 0; i < 32; i++) {
-        int ctx[4], hi[4];
-        if (quick) for (int L = 0; L < n; L++) {           /* -q: the high nibble by its bucket's full table */
-            int cb = q40_cb(P[c0[L] + i], inv[L], ds[L]) >> 6; ctx[L] = cb * 48;
-            RD_GETT(D, L, U + (size_t)ctx[L] * 16, FS + (size_t)cb * SM, hi[L]);
-        }
-        else for (int L = 0; L < n; L++) { ctx[L] = q80_ctx1(P, c0[L] + i, inv[L], ds[L], nx[L], sa[L], i); RD_GET(D, L, U + (size_t)ctx[L] * 16, hi[L]); }
-        for (int L = 0; L < n; L++) {
-            int lo; RD_GET(D, L, U + (size_t)(Q8_CTX + ctx[L] * 16 + hi[L]) * 16, lo);
-            int v = ((hi[L] << 4) | lo) - 128; q[L][i] = (int8_t)v;
-            nx[L] += v >= 127 || v <= -127; sa[L] += v < 0 ? -v : v;
-        }
+    /* the column buckets are those at the start of the group: all of them first, then the values */
+    uint8_t cbv[4][32];
+    for (int L = 0; L < n; L++) for (int i = 0; i < 32; i++) cbv[L][i] = (uint8_t)(q40_cb(P[c0[L] + i], inv[L], ds[L]) >> 6);
+    const int fast = D->end - D->p >= 2 * 64 * 4;       /* enough input for every value: refills unchecked */
+    #define Q80_VALS(NC) for (int i = 0; i < 32; i++) {                                                  \
+        int ctx[4], hi[4];                                                                             \
+        if (quick) for (int L = 0; L < n; L++) {           /* -q: the high nibble by its bucket's full table */ \
+            int cb = cbv[L][i]; ctx[L] = cb * 48;                                                      \
+            if (NC) RD_GETT_NC(D, L, U + (size_t)ctx[L] * 16, FS + (size_t)cb * SM, hi[L]);           \
+            else RD_GETT(D, L, U + (size_t)ctx[L] * 16, FS + (size_t)cb * SM, hi[L]);                 \
+        }                                                                                              \
+        else for (int L = 0; L < n; L++) {                                                             \
+            ctx[L] = (cbv[L][i] * 3 + (nx[L] < 2 ? nx[L] : 2)) * 16 + Q8_AV[i][sa[L] >> 3];            \
+            if (NC) RD_GET_NC(D, L, U + (size_t)ctx[L] * 16, hi[L]); else RD_GET(D, L, U + (size_t)ctx[L] * 16, hi[L]); \
+        }                                                                                              \
+        for (int L = 0; L < n; L++) {                                                                  \
+            int lo; const int16_t *R_ = U + (size_t)(Q8_CTX + ctx[L] * 16 + hi[L]) * 16;               \
+            if (NC) RD_GET_NC(D, L, R_, lo); else RD_GET(D, L, R_, lo);                                \
+            int v = ((hi[L] << 4) | lo) - 128; q[L][i] = (int8_t)v;                                    \
+            nx[L] += v >= 127 || v <= -127; sa[L] += v < 0 ? -v : v;                                   \
+        }                                                                                              \
     }
+    if (fast) { Q80_VALS(1) } else { Q80_VALS(0) }
+    #undef Q80_VALS
     for (int L = 0; L < n; L++) {
         uint8_t *B = data + (b0 + L) * 34; memcpy(B + 2, q[L], 32);
         q80_cols(P, b0 + L, bpr, B, ds[L], 1);
@@ -1143,6 +1754,157 @@ HOT void q80_decode(const uint8_t *in, size_t len, uint8_t *data, uint64_t rows,
 static void q80_code(Coder *c, uint8_t *data, uint64_t rows, uint64_t ne0, int quick) {
     if (!c->dec && c->cnt_only) q80_count(c->cnt, data, rows, ne0, quick);
     else die("internal: Q8_0 is coded with q80_encode / q80_decode");
+}
+
+/* ---------------- Q3_K in rANS lanes ---------------- */
+/* block: hmask(32) qs(64) scales(12) d(2); 16 sub-blocks of 16 values, w = d * (sc - 32) * (q - 4)
+   with q = 2 low bits (qs) + a high bit (hmask) in 0..7 and sc a 6-bit scale (llama.cpp's layout:
+   value i = 128 n + 32 j + l takes bits 2j of qs[32 n + l] and bit 4n + j of hmask[l]; scale j's low
+   nibble is byte j (j < 8) or the high nibble of byte j - 8, its top 2 bits are bits 2 (j / 4) of
+   byte 8 + j % 4). Both are bijections, so every block is rebuilt exactly.
+   Like Q6_K's lanes: blocks in groups of 4, block b's header in lane b % 4 (history: the lane's
+   previous block), lane L takes sub-blocks L, 4 + L, 8 + L, 12 + L of each block.
+   - header: d (fp16) as four nibbles with the float contexts; each scale as a high 2-bit and a low
+     4-bit symbol, as Q4_K's (high given the previous scale, low given the high one and the previous)
+   - values: given only the size of the sub-block's scale |sc - 32| (5 buckets), so every row is
+     known before its values and each gets a full slot -> symbol table. Measured on Qwen3-4B
+     Q3_K_M (counts over all its Q3_K tensors): order 0 2.8807 bits per value, the scale size
+     2.8758; Q4_0's column share, extremes seen and position together 2.8731, the best of 15
+     combinations 2.8676. The values are close to their order-0 entropy whatever the context, so the
+     cheapest context wins: no column counts, and no value depends on another.
+   Values are coded in pairs: two adjacent values of a sub-block as one symbol of 64 (the first in
+   the low 3 bits), so a sub-block takes 8 rANS steps instead of 16.
+   Table rows (Q3_K: 64 symbols wide): Q3_VCTX value contexts, then Q3H_CTX header rows (16 used). */
+#define Q3_VCTX 5
+#define Q3_KS 64
+enum { Q3H_D = 0, Q3H_SH = FL_HI, Q3H_SL = FL_HI + 64, Q3H_CTX = FL_HI + 64 + 256, Q3H_N = 36 };
+static void q3_unpack_scales(const uint8_t *s, int *sc) {
+    for (int j = 0; j < 16; j++) sc[j] = (j < 8 ? s[j] & 15 : s[j - 8] >> 4) | (((s[8 + j % 4] >> (2 * (j / 4))) & 3) << 4);
+}
+static void q3_pack_scales(uint8_t *s, const int *sc) {
+    memset(s, 0, 12);
+    for (int j = 0; j < 16; j++) {
+        if (j < 8) s[j] |= (uint8_t)(sc[j] & 15); else s[j - 8] |= (uint8_t)((sc[j] & 15) << 4);
+        s[8 + j % 4] |= (uint8_t)((sc[j] >> 4) << (2 * (j / 4)));
+    }
+}
+static void q3_unpack(const uint8_t *B, uint8_t *q) {
+    const uint8_t *hm = B, *qs = B + 32;
+    for (int n = 0; n < 2; n++) for (int j = 0; j < 4; j++) for (int l = 0; l < 32; l++)
+        q[128 * n + 32 * j + l] = (uint8_t)(((qs[32 * n + l] >> (2 * j)) & 3) | (((hm[l] >> (4 * n + j)) & 1) << 2));
+}
+static void q3_pack(uint8_t *B, const uint8_t *q) {
+    uint8_t *hm = B, *qs = B + 32; memset(B, 0, 96);
+    for (int n = 0; n < 2; n++) for (int j = 0; j < 4; j++) for (int l = 0; l < 32; l++) {
+        int v = q[128 * n + 32 * j + l];
+        qs[32 * n + l] |= (uint8_t)((v & 3) << (2 * j)); hm[l] |= (uint8_t)((v >> 2) << (4 * n + j));
+    }
+}
+/* the 36 header symbols of block B and their table rows (from Q3_VCTX), in coding order; P: the lane's previous block */
+static void q3_hdr_syms(const uint8_t *B, const uint8_t *P, uint16_t *ctx, uint8_t *sym) {
+    int sc[16], psc = 0;
+    q3_unpack_scales(B + 96, sc);
+    if (P) { int s2[16]; q3_unpack_scales(P + 96, s2); psc = s2[15]; }
+    kq_f16_syms(rd16(B + 108), P ? rd16(P + 108) : 0, Q3_VCTX + Q3H_D, ctx, sym);
+    for (int j = 0; j < 16; j++) {
+        int o = 4 + 2 * j, sh = sc[j] >> 4;
+        sym[o] = (uint8_t)sh;              ctx[o] = (uint16_t)(Q3_VCTX + Q3H_SH + psc);
+        sym[o + 1] = (uint8_t)(sc[j] & 15); ctx[o + 1] = (uint16_t)(Q3_VCTX + Q3H_SL + psc * 4 + sh);
+        psc = sc[j];
+    }
+}
+static int q3_smag(int sc) { int a = sc - 32; a = a < 0 ? -a : a; return a <= 1 ? 0 : a <= 3 ? 1 : a <= 7 ? 2 : a <= 15 ? 3 : 4; }
+/* block B's value rows, in block order */
+static void q3_vctx(const uint8_t *B, uint16_t *ctx) {
+    int sc[16]; q3_unpack_scales(B + 96, sc);
+    for (int s = 0; s < 16; s++) { uint16_t r = (uint16_t)q3_smag(sc[s]); for (int p = 0; p < 16; p++) ctx[s * 16 + p] = r; }
+}
+static void q3_count(uint32_t *cnt, const uint8_t *data, uint64_t nblocks) {
+    for (uint64_t b = 0; b < nblocks; b++) {
+        const uint8_t *B = data + b * 110; uint16_t hc[Q3H_N], ctx[256]; uint8_t hs[Q3H_N], q[256];
+        q3_hdr_syms(B, b >= 4 ? B - 4 * 110 : NULL, hc, hs);
+        for (int k = 0; k < Q3H_N; k++) cnt[(size_t)hc[k] * Q3_KS + hs[k]]++;
+        q3_unpack(B, q); q3_vctx(B, ctx);
+        for (int i = 0; i < 256; i += 2) cnt[(size_t)ctx[i] * Q3_KS + (q[i] | (q[i + 1] << 3))]++;
+    }
+}
+/* encode: the reverse of the decoder's order, words written backwards. 0 if it does not fit in cap. */
+static size_t q3_encode(const uint8_t *data, uint64_t nb, const int16_t *U, uint8_t *out, size_t cap) {
+    size_t head = 16;
+    if (cap < head + 2) return 0;
+    size_t nw = (cap - head) / 2; uint16_t *w = xmalloc(nw * 2 + 2), *wp = w + nw;
+    uint32_t x[4] = {RANS_L, RANS_L, RANS_L, RANS_L};
+    for (uint64_t g = (nb + 3) / 4; g-- > 0;) {
+        uint64_t b0 = g * 4; int n = nb - b0 < 4 ? (int)(nb - b0) : 4;
+        uint8_t q[4][256], hs[4][Q3H_N]; uint16_t ctx[4][256], hc[4][Q3H_N];
+        for (int L = 0; L < n; L++) {
+            const uint8_t *B = data + (b0 + L) * 110;
+            q3_unpack(B, q[L]); q3_vctx(B, ctx[L]); q3_hdr_syms(B, b0 ? B - 4 * 110 : NULL, hc[L], hs[L]);
+        }
+        for (int bi = n - 1; bi >= 0; bi--)                 /* values: block by block, lane L sub-blocks L, 4 + L, ... */
+            for (int gg = 3; gg >= 0; gg--) for (int jp = 7; jp >= 0; jp--) for (int L = 3; L >= 0; L--) {
+                int i = (4 * gg + L) * 16 + 2 * jp;
+                if (!rans_put(&x[L], U + (size_t)ctx[bi][i] * Q3_KS, q[bi][i] | (q[bi][i + 1] << 3), &wp, w)) goto full;
+            }
+        for (int k = Q3H_N - 1; k >= 0; k--) for (int L = n - 1; L >= 0; L--)
+            if (!rans_put(&x[L], U + (size_t)hc[L][k] * Q3_KS, hs[L][k], &wp, w)) goto full;
+    }
+    {
+        size_t words = (size_t)(w + nw - wp);
+        for (int L = 0; L < 4; L++) memcpy(out + 4 * L, &x[L], 4);
+        memcpy(out + head, wp, words * 2); free(w);
+        return head + words * 2;
+    }
+full:
+    free(w); return 0;
+}
+/* one group of n blocks: the headers (lane = block), then each block's values (lane L: sub-blocks L, 4 + L, ...) */
+static inline __attribute__((always_inline)) void q3_dgroup(RansDec *D, uint8_t *data, uint64_t b0, const int n,
+                                                            const int16_t *U, int *pa, int *pb, int *ps, const uint8_t *FS) {
+    const int16_t *UH = U + (size_t)Q3_VCTX * Q3_KS;
+    int a[4] = {0}, bn[4] = {0}, cn[4] = {0}, dn[4] = {0}, sc[4][16];
+    for (int L = 0; L < n; L++) RD_GET(D, L, UH + (size_t)(Q3H_D + pa[L]) * Q3_KS, a[L]);
+    for (int L = 0; L < n; L++) RD_GET(D, L, UH + (size_t)(Q3H_D + 16 + ((a[L] << 4) | pb[L])) * Q3_KS, bn[L]);
+    for (int L = 0; L < n; L++) RD_GET(D, L, UH + (size_t)(Q3H_D + 272 + ((a[L] << 4) | bn[L])) * Q3_KS, cn[L]);
+    for (int L = 0; L < n; L++) RD_GET(D, L, UH + (size_t)(Q3H_D + 528 + cn[L]) * Q3_KS, dn[L]);
+    for (int j = 0; j < 16; j++) {
+        int sh[4] = {0};
+        for (int L = 0; L < n; L++) { RD_GET(D, L, UH + (size_t)(Q3H_SH + ps[L]) * Q3_KS, sh[L]); sh[L] &= 3; }
+        for (int L = 0; L < n; L++) { int lo; RD_GET(D, L, UH + (size_t)(Q3H_SL + ps[L] * 4 + sh[L]) * Q3_KS, lo); sc[L][j] = (sh[L] << 4) | (lo & 15); ps[L] = sc[L][j]; }
+    }
+    uint16_t dd[4];
+    for (int L = 0; L < n; L++) {
+        dd[L] = (uint16_t)((a[L] << 12) | (bn[L] << 8) | (cn[L] << 4) | dn[L]); pa[L] = a[L]; pb[L] = bn[L];
+        uint8_t *B = data + (b0 + L) * 110; wr16(B + 108, dd[L]); q3_pack_scales(B + 96, sc[L]);
+    }
+    for (int bi = 0; bi < n; bi++) {
+        uint8_t *B = data + (b0 + bi) * 110, q[256]; int r[16];
+        for (int j = 0; j < 16; j++) r[j] = q3_smag(sc[bi][j]);
+        int fast = D->end - D->p >= 2 * 128;            /* enough input for the whole block: refill unchecked */
+        for (int gg = 0; gg < 4; gg++) {
+            int rl[4]; for (int L = 0; L < 4; L++) rl[L] = r[4 * gg + L];
+            #define Q3_PAIRS(NC) for (int jp = 0; jp < 8; jp++) for (int L = 0; L < 4; L++) {                   \
+                int sy, i = (4 * gg + L) * 16 + 2 * jp;                                                          \
+                if (NC) RD_GETT_NC(D, L, U + (size_t)rl[L] * Q3_KS, FS + (size_t)rl[L] * SM, sy);               \
+                else RD_GETT(D, L, U + (size_t)rl[L] * Q3_KS, FS + (size_t)rl[L] * SM, sy);                     \
+                q[i] = (uint8_t)(sy & 7); q[i + 1] = (uint8_t)((sy >> 3) & 7); }
+            if (fast) { Q3_PAIRS(1) } else { Q3_PAIRS(0) }
+            #undef Q3_PAIRS
+        }
+        q3_pack(B, q);
+    }
+}
+static int q3_qrow(int r) { return r; }
+/* decode; corrupt input gives wrong values, never reads outside in[0..len) */
+HOT void q3_decode(const uint8_t *in, size_t len, uint8_t *data, uint64_t nb, const int16_t *U) {
+    if (len < 16) die("corrupt file");
+    RansDec D; for (int L = 0; L < 4; L++) memcpy(&D.x[L], in + 4 * L, 4);
+    D.p = in + 16; D.end = in + len;
+    int pa[4] = {0}, pb[4] = {0}, ps[4] = {0}; uint64_t b0 = 0;
+    uint8_t *FS = slot_tables_k(U, Q3_VCTX, q3_qrow, Q3_KS);
+    for (; b0 + 4 <= nb; b0 += 4) q3_dgroup(&D, data, b0, 4, U, pa, pb, ps, FS);
+    if (b0 < nb) q3_dgroup(&D, data, b0, (int)(nb - b0), U, pa, pb, ps, FS);
+    free(FS);
 }
 
 /* ---------------- Q6_K in rANS lanes ---------------- */
@@ -1502,7 +2264,9 @@ HOT void q6l_decode(const uint8_t *in, size_t len, uint8_t *data, uint64_t rows,
 /* ---------------- other bytes: context mixing ---------------- */
 /* Predictors with the previous 0, 1, 2, 3, 4 and 6 bytes as context (orders 2+ hashed),
    mixed in the logistic domain by a small neural mixer chosen by the bits of the current
-   byte seen so far. Integer arithmetic only, so results are identical on every platform. */
+   byte seen so far. Integer arithmetic only, so results are identical on every platform.
+   With -q, the metadata strings use orders 0 and 1 and the match model only: measured on
+   Qwen3.5-2B's tokenizer (9.5 MiB), 1.580 -> 1.856 bits per byte (+0.3 MiB) in 63% less time. */
 static int SQT[33] = {1, 2, 3, 6, 10, 16, 27, 45, 73, 120, 194, 310, 488, 747, 1101, 1546, 2047,
                       2549, 2994, 3348, 3607, 3785, 3901, 3975, 4024, 4050, 4068, 4079, 4085, 4089, 4092, 4093, 4094};
 static int squash(int d) {                     /* stretch domain (x256) -> probability (12 bits) */
@@ -1534,9 +2298,9 @@ static Bit *bits_new_aligned(size_t n) {
 static inline uint32_t bucket(uint32_t h, int hb) { return ((h * 0x85EBCA6Bu) >> (32 - (hb - 4))) << 4; }
 static int bytes_hb(uint64_t n) { int hb = 16; while (hb < 23 && ((uint64_t)1 << hb) < n * 2) hb++; return hb; }
 HOT void bytes_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t n) {
-    int hb = bytes_hb(n);
+    int hb = bytes_hb(n); const int nh = c->bm_quick ? 0 : 4;   /* hashed orders used */
     Bit *o0 = bits_new(256), *o1 = bits_new(65536);
-    Bit *h[4]; for (int i = 0; i < 4; i++) h[i] = bits_new_aligned((size_t)1 << hb);
+    Bit *h[4] = {0}; for (int i = 0; i < nh; i++) h[i] = bits_new_aligned((size_t)1 << hb);
     int32_t *W = xmalloc(256 * 3 * NIN * sizeof *W);
     for (int i = 0; i < 256 * 3 * NIN; i++) W[i] = 19661;      /* 0.3 */
     uint64_t hist = 0;
@@ -1553,16 +2317,16 @@ HOT void bytes_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t n) {
         for (int k = 7; k >= 0; k--) {
             if (k == 7 || k == 3) {                            /* new nibble: one cache line per context */
                 uint32_t hi = k == 3 ? (uint32_t)node * 0x01000193u : 0;
-                for (int m = 0; m < 4; m++) { bk[m] = bucket(hs[m] ^ hi, hb); __builtin_prefetch(&h[m][bk[m]]); }
+                for (int m = 0; m < nh; m++) { bk[m] = bucket(hs[m] ^ hi, hb); __builtin_prefetch(&h[m][bk[m]]); }
             }
             int ok = mlen && ((pb | 256) >> (k + 1)) == node, eb = (pb >> k) & 1;
             Bit *bm = &mm[(ok ? (mlen < 31 ? mlen : 31) + 1 : 0) * 2 + (ok ? eb : 0)];
             /* position inside the nibble: 1..15 (high nibble: node, low nibble: 1 + bits seen of it) */
             int in = k >= 4 ? node : (1 << (3 - k)) | (node & ((1 << (3 - k)) - 1));
-            Bit *b[6] = {&o0[node], &o1[c1 * 256 + node],
-                         &h[0][bk[0] + in], &h[1][bk[1] + in], &h[2][bk[2] + in], &h[3][bk[3] + in]};
-            int st[NIN]; int64_t dot = 0; int32_t *w = W + node * NIN;
-            for (int m = 0; m < 6; m++) { int p1 = (65536 - b[m]->p) >> 4; st[m] = STR[p1 < 1 ? 1 : p1 > 4095 ? 4095 : p1]; }
+            Bit *b[6] = {&o0[node], &o1[c1 * 256 + node], 0, 0, 0, 0};
+            for (int m = 0; m < nh; m++) b[2 + m] = &h[m][bk[m] + in];
+            int st[NIN] = {0}; int64_t dot = 0; int32_t *w = W + node * NIN;
+            for (int m = 0; m < 2 + nh; m++) { int p1 = (65536 - b[m]->p) >> 4; st[m] = STR[p1 < 1 ? 1 : p1 > 4095 ? 4095 : p1]; }
             { int p1m = (65536 - bm->p) >> 4; st[6] = ok ? STR[p1m < 1 ? 1 : p1m > 4095 ? 4095 : p1m] : 0; }
             st[7] = 256;
             w += (size_t)(ok ? (mlen < 16 ? 1 : 2) : 0) * 256 * NIN;
@@ -1574,7 +2338,7 @@ HOT void bytes_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t n) {
             int bit = code_bit(c, dec, p0, (byte >> k) & 1);
             int err = (bit << 12) - p1;
             for (int m = 0; m < NIN; m++) w[m] += (st[m] * err) >> 10;
-            for (int m = 0; m < 6; m++) bit_update_fast(b[m], bit);
+            for (int m = 0; m < 2 + nh; m++) bit_update_fast(b[m], bit);
             bit_update_fast(bm, bit);
             node = (node << 1) | bit;
         }
@@ -1649,7 +2413,10 @@ static uint64_t seg_bytes(const Seg *s) {                 /* untrusted on decomp
 }
 static void code_seg(Coder *c, Seg *s, uint8_t *p) {
     switch (s->type) {
-        case T_Q4K: kq_code(c, p, s->size / 144, 4, (s->model & 255) == M_QUICK); break;
+        case T_Q4K: if ((s->model & 255) != M_GPU) kq_code(c, p, s->size / 144, 4, (s->model & 255) == M_QUICK);
+                    else if (!c->dec && c->cnt_only) kqg_count(c->cnt, p, s->size / 144);
+                    else die("internal: -g");
+                    break;
         case T_Q5K: kq_code(c, p, s->size / 176, 5, (s->model & 255) == M_QUICK); break;
         case T_Q6K:
             if (!c->dec && c->cnt_only) q6_count(c->cnt, p, s->rows, s->ne0);
@@ -1657,8 +2424,12 @@ static void code_seg(Coder *c, Seg *s, uint8_t *p) {
             break;
         case T_Q8_0: q80_code(c, p, s->rows, s->ne0, (s->model & 255) == M_QUICK); break;
         case T_Q4_0: q40_code(c, p, s->rows, s->ne0, (s->model & 255) == M_QUICK); break;
+        case T_Q3K:
+            if (!c->dec && c->cnt_only) q3_count(c->cnt, p, s->size / 110);
+            else die("internal: Q3_K is coded with q3_encode / q3_decode");
+            break;
         case T_BYTES: bytes_code(c, p, s->size); break;
-        case T_STRS: strs_code(c, p, s->size); break;
+        case T_STRS: c->bm_quick = (s->model & 255) == M_QUICK; strs_code(c, p, s->size); c->bm_quick = 0; break;
         case T_M32: float_code(c, p, s->rows * s->ne0, T_F32); break;
         default: float_code(c, p, s->rows * s->ne0, s->type);
     }
@@ -1667,23 +2438,23 @@ static void code_seg(Coder *c, Seg *s, uint8_t *p) {
 /* ---------------- static value tables ---------------- */
 /* types with static value tables (every tensor type, and metadata arrays of 32-bit values, which
    share F32's tables): index, symbols per context, contexts */
-#define NSTATIC 9                                /* 8: Q6_K lattice segments */
+#define NSTATIC 12                               /* 8: Q6_K lattice segments, 9: Q3_K, 10: quick Q4_K (pairs), 11: -g Q4_K */
 static int kq_index(uint32_t type) {
     return type == T_Q4K ? 0 : type == T_Q5K ? 1 : type == T_Q6K ? 2 : type == T_Q8_0 ? 3 :
-           type == T_BF16 ? 4 : type == T_F16 ? 5 : type == T_F32 || type == T_M32 ? 6 : type == T_Q4_0 ? 7 : -1;
+           type == T_BF16 ? 4 : type == T_F16 ? 5 : type == T_F32 || type == T_M32 ? 6 : type == T_Q4_0 ? 7 : type == T_Q3K ? 9 : -1;
 }
-static const int KQ_SYM[NSTATIC] = {16, 32, 64, 16, 16, 16, 16, 16, 64},
-                 KQ_CTX[NSTATIC] = {32 * 36 + KH_CTX, 64 * 36 + KH_CTX, Q6_CTX + Q6H_CTX, Q8_CTX * 17 + Q8H_CTX, FL_HI, FL_HI, FL_HI + FL_LO, Q40_VCTX + FL_HI, Q6L_N + Q6H_CTX};
+static const int KQ_SYM[NSTATIC] = {16, 32, 64, 16, 16, 16, 16, 16, 64, 64, 256, 16},
+                 KQ_CTX[NSTATIC] = {32 * 36 + KH_CTX, 64 * 36 + KH_CTX, Q6_CTX + Q6H_CTX, Q8_CTX * 17 + Q8H_CTX, FL_HI, FL_HI, FL_HI + FL_LO, Q40_VCTX + FL_HI, Q6L_N + Q6H_CTX, Q3_VCTX + Q3H_CTX, KP_VCTX + KH_CTX, KQG_VCTX + KH_CTX};
 /* segments coded with static tables: tensor types, not raw */
 /* types with a quick model (-q) */
-static int has_quick(uint32_t type) { return type == T_Q4K || type == T_Q5K || type == T_Q4_0 || type == T_Q8_0 || type == T_BF16 || type == T_F16 || type == T_F32; }
+static int has_quick(uint32_t type) { return type == T_STRS || type == T_Q4K || type == T_Q5K || type == T_Q4_0 || type == T_Q8_0 || type == T_BF16 || type == T_F16 || type == T_F32; }
 static int is_static(const Seg *s) {
     int md = s->model & 255;
     return kq_index(s->type) >= 0 && (md == M_NORMAL || (md == M_LATTICE && s->type == T_Q6K) ||
-                                      (md == M_QUICK && has_quick(s->type)));
+                                      (md == M_QUICK && has_quick(s->type)) || (md == M_GPU && s->type == T_Q4K));
 }
 /* the segment's table set: by type, and Q6_K lattice segments their own */
-static int tab_index(const Seg *s) { return s->type == T_Q6K && (s->model & 255) == M_LATTICE ? 8 : kq_index(s->type); }
+static int tab_index(const Seg *s) { return s->type == T_Q4K && (s->model & 255) == M_GPU ? 11 : s->type == T_Q6K && (s->model & 255) == M_LATTICE ? 8 : s->type == T_Q4K && (s->model & 255) == M_QUICK ? 10 : kq_index(s->type); }
 static int is_kq45(uint32_t type) { return type == T_Q4K || type == T_Q5K; }
 /* static segments, all coded in rANS lanes: floats, K-quants (both Q6_K models), Q4_0, Q8_0 */
 static int is_rans(const Seg *s) { return is_static(s); }
@@ -1783,7 +2554,7 @@ static void code_seeds(Coder *c, int dec, Seed sd[NSTATIC]) {
    tables U for coding (unused contexts: the seed; contexts the seed lacks: uniform). */
 static void code_tables(Coder *c, int dec, const Seed *sd, const uint16_t *own, const uint32_t *ownN, int16_t *U) {
     int k = sd->k; IntM m = intm_new(k); Bit um[2], om[2], so; bits_init(um, 2); bits_init(om, 2); bits_init(&so, 1);
-    int pu = 0, po = 0; uint16_t f[64];
+    int pu = 0, po = 0; uint16_t f[256];
     /* first a flag: the whole segment uses the seed as it is, with no table section (small
        segments, or ones like the seed); the encoder picks whichever its estimate makes cheaper */
     int seed_only = 0;
@@ -2231,6 +3002,7 @@ static uint64_t model_bytes(const Seg *s) {
     switch (s->type) {
         case T_Q4K: case T_Q5K: return 0; /* static tables only: counted in seg_need */
         case T_Q4_0: case T_Q8_0: return 4 * s->ne0;   /* column counts */
+        case T_Q3K: return 5 * SM;                     /* the slot tables */
         case T_Q6K: return B * (3 * 65536 + 33 * 64 + 9 * 64 + 66 * 128 + 33 * 8) + 2 * (uint64_t)(4096 * 16 + 66 * 128 + 33 * 72)  /* lattice */
                            + 2 * sizeof(Q6F) * s->ne0 + (uint64_t)Q6_CHUNK * (256 + Q6H_N) * 5;                                       /* rANS: column sums, chunk */
         case T_BYTES: { int hb = bytes_hb(s->size);
@@ -2266,7 +3038,25 @@ static double count_bits(const uint32_t *cnt, int nctx, int k) {
     }
     return bits;
 }
-static uint64_t held_bytes(const Seg *s) { int t = tab_index(s); return (uint64_t)KQ_CTX[t] * (KQ_SYM[t] * 2 + 4); }
+/* -q Q4_K's pair tables: the header rows use 16 of their 256 symbols, so between the passes each
+   segment keeps them compact (16 entries per header row) and expands them for pass 2 */
+#define KP_COMPACT ((size_t)KP_VCTX * 256 + (size_t)KH_CTX * 16)
+static uint16_t *kp_compact(uint16_t *f) {
+    uint16_t *c = xmalloc(KP_COMPACT * 2); memcpy(c, f, (size_t)KP_VCTX * 256 * 2);
+    for (int x = 0; x < KH_CTX; x++) {
+        const uint16_t *r = f + (size_t)(KP_VCTX + x) * 256;
+        for (int q = 16; q < 256; q++) if (r[q]) die("internal: pair table header row");
+        memcpy(c + (size_t)KP_VCTX * 256 + (size_t)x * 16, r, 32);
+    }
+    free(f); return c;
+}
+static uint16_t *kp_expand(uint16_t *c) {
+    uint16_t *f = calloc((size_t)(KP_VCTX + KH_CTX) * 256, 2); if (!f) die("out of memory");
+    memcpy(f, c, (size_t)KP_VCTX * 256 * 2);
+    for (int x = 0; x < KH_CTX; x++) memcpy(f + (size_t)(KP_VCTX + x) * 256, c + (size_t)KP_VCTX * 256 + (size_t)x * 16, 32);
+    free(c); return f;
+}
+static uint64_t held_bytes(const Seg *s) { int t = tab_index(s); return t == 10 ? KP_COMPACT * 2 + (uint64_t)KQ_CTX[t] * 4 : (uint64_t)KQ_CTX[t] * (KQ_SYM[t] * 2 + 4); }
 #define MiB(x) ((double)(x) / 1048576.0)
 /* Fix the memory budget from what the device has free now, keeping a reserve for the system
    and other apps: 15% of RAM, at least 512 MiB, at most 2 GiB. limit (-m) replaces all this. */
@@ -2348,10 +3138,12 @@ static void static_rans_decode(Job *j, Seg *s, const uint8_t *in, size_t len, ui
     Coder d; dec_init(&d, in + 4, tl); code_tables(&d, 1, &j->dseed[t], NULL, NULL, U);
     uint8_t *Lt = uses_lut(s) ? lut_build(U, (size_t)KQ_CTX[t], KQ_SYM[t], s->type == T_Q6K ? Q6_LUTB : KQ_SYM[t]) : NULL;   /* every row sums to SM: checked above */
     const uint8_t *body = in + 4 + tl; size_t blen = len - 4 - tl;
-    if (is_kq45(s->type)) {
+    if (t == 11) kqg_decode(body, blen, s->size / 144, U, out);
+    else if (is_kq45(s->type)) {
         int bits = s->type == T_Q4K ? 4 : 5;
         kq_lanes_decode(body, blen, out, s->size / (bits == 4 ? 144 : 176), bits, (s->model & 255) == M_QUICK, U, Lt);
     } else if (s->type == T_Q4_0) q40_decode(body, blen, out, s->rows, s->ne0, U, (s->model & 255) == M_QUICK);
+    else if (s->type == T_Q3K) q3_decode(body, blen, out, s->size / 110, U);
     else if (s->type == T_Q8_0) q80_decode(body, blen, out, s->rows, s->ne0, U, (s->model & 255) == M_QUICK);
     else if (s->type == T_Q6K) {
         if (t == 8) q6l_decode(body, blen, out, s->rows, s->ne0, U, Lt);
@@ -2396,15 +3188,18 @@ static void *worker(void *arg) {
                 int16_t *U = xmalloc(tn * 2);
                 /* rANS segments: the range coder holds only the table section, far smaller than the
                    segment (bytes past its cap are counted, and the segment is then stored raw) */
+                if (t == 10) j->ownf[i] = kp_expand(j->ownf[i]);
                 enc_init(&c, is_rans(s) ? rans_tab_cap(s) : s->size); code_tables(&c, 0, &j->seed[t], j->ownf[i], j->ownN[i], U);
                 if (is_rans(s)) {                            /* table section, then everything else in rANS */
                     enc_flush(&c);
                     uint8_t *o = xmalloc(s->size + 16); size_t total = s->size;
                     if (c.pos <= c.cap && c.pos + 4 + 4 * FL_LANES + 2 < s->size) {
                         uint32_t tl = (uint32_t)c.pos; memcpy(o, &tl, 4); memcpy(o + 4, c.buf, tl);
-                        size_t r = is_kq45(s->type)
+                        size_t r = t == 11 ? kqg_encode(src, s->size / 144, U, o + 4 + tl, s->size - 4 - tl)
+                            : is_kq45(s->type)
                             ? kq_lanes_encode(src, s->size / (s->type == T_Q4K ? 144 : 176), s->type == T_Q4K ? 4 : 5, (s->model & 255) == M_QUICK, U, o + 4 + tl, s->size - 4 - tl)
                             : s->type == T_Q4_0 ? q40_encode(src, s->rows, s->ne0, (s->model & 255) == M_QUICK, U, o + 4 + tl, s->size - 4 - tl)
+                            : s->type == T_Q3K ? q3_encode(src, s->size / 110, U, o + 4 + tl, s->size - 4 - tl)
                             : s->type == T_Q8_0 ? q80_encode(src, s->rows, s->ne0, (s->model & 255) == M_QUICK, U, o + 4 + tl, s->size - 4 - tl)
                             : s->type == T_Q6K ? (t == 8 ? q6l_encode : q6_encode)(src, s->rows, s->ne0, U, o + 4 + tl, s->size - 4 - tl)
                             : float_encode(src, s->rows * s->ne0, fl_type(s->type), (s->model & 255) == M_QUICK, U, o + 4 + tl, s->size - 4 - tl);
@@ -2420,7 +3215,8 @@ static void *worker(void *arg) {
                 size_t tn = (size_t)KQ_CTX[t] * KQ_SYM[t];
                 uint32_t *cnt = calloc(tn, 4); if (!cnt) die("out of memory");
                 int fl = s->type == T_BF16 || s->type == T_F16 || s->type == T_F32;
-                s->model = j->quick && has_quick(s->type) && !fl ? M_QUICK : M_NORMAL;
+                s->model = G_GPUENC && s->type == T_Q4K ? M_GPU : j->quick && has_quick(s->type) && !fl ? M_QUICK : M_NORMAL;
+                if (tab_index(s) != t) { t = tab_index(s); tn = (size_t)KQ_CTX[t] * KQ_SYM[t]; free(cnt); cnt = calloc(tn, 4); if (!cnt) die("out of memory"); }
                 { Coder cc; memset(&cc, 0, sizeof cc); cc.cnt = cnt; cc.cnt_only = 1; code_seg(&cc, s, (uint8_t *)src); }
                 if (j->quick && fl) {                        /* -q floats: only if uniform low nibbles cost under 1% */
                     double all = count_bits(cnt, KQ_CTX[t], 16), uni = 0, mod = 0;
@@ -2443,20 +3239,21 @@ static void *worker(void *arg) {
                 }
                 {
                     int k = KQ_SYM[t], nx = KQ_CTX[t];
-                    uint16_t *f = xmalloc(tn * 2); uint32_t *N = xmalloc((size_t)nx * 4); uint64_t row[64];
+                    uint16_t *f = xmalloc(tn * 2); uint32_t *N = xmalloc((size_t)nx * 4); uint64_t row[256];
                     for (int x = 0; x < nx; x++) { uint64_t sum = 0;
                         for (int q = 0; q < k; q++) { row[q] = cnt[(size_t)x * k + q]; sum += row[q]; }
                         N[x] = (uint32_t)sum; quantize(row, k, f + (size_t)x * k); }
                     pthread_mutex_lock(&j->mu);
                     if (!j->seed[t].agg) { j->seed[t].agg = calloc(tn, 8); if (!j->seed[t].agg) die("out of memory"); }
                     for (size_t q = 0; q < tn; q++) j->seed[t].agg[q] += cnt[q];
+                    if (t == 10) f = kp_compact(f);
                     j->ownf[i] = f; j->ownN[i] = N; j->held[i] = held_bytes(s);
                     j->used += j->held[i]; if (j->used > j->peak) j->peak = j->used;
                     pthread_mutex_unlock(&j->mu);
                     free(cnt);
                 }
             } else {
-                s->model = M_NORMAL;
+                s->model = j->quick && s->type == T_STRS ? M_QUICK : M_NORMAL;
                 enc_init(&c, s->size); code_seg(&c, s, (uint8_t *)src); enc_flush(&c);
                 finish_coded(j, i, s, &c, src);
             }
@@ -2499,8 +3296,8 @@ static void *worker(void *arg) {
    arrays estimated 14x: about half their bytes go to the byte model, the lengths cost little */
 static int SORT_PASS1, SORT_QUICK;                          /* compress pass 1: whether Q6_K tries the lattice is not known yet */
 static double seg_cost(const Seg *s) {
-    if ((s->model & 255) == M_QUICK || (SORT_QUICK && has_quick(s->type))) return (double)s->size * (s->type == T_Q8_0 ? 1.2 : 0.65);
-    double w = s->type == T_BYTES ? 25 : s->type == T_STRS ? 14 : s->type == T_Q8_0 ? 1.8 : s->type == T_Q4_0 ? 1.6 : s->type == T_Q5K ? 0.85 :
+    if ((s->model & 255) == M_QUICK || (SORT_QUICK && has_quick(s->type))) return (double)s->size * (s->type == T_STRS ? 6 : s->type == T_Q8_0 ? 1.2 : 0.65);
+    double w = s->type == T_BYTES ? 25 : s->type == T_STRS ? 14 : s->type == T_Q8_0 ? 1.8 : s->type == T_Q4_0 ? 1.6 : s->type == T_Q3K ? 0.8 : s->type == T_Q5K ? 0.85 :
                s->type != T_Q6K ? 1 : SORT_PASS1 ? 2 : (s->model & 255) == M_LATTICE ? 3 : 1.1;
     return (double)s->size * w;
 }
@@ -2544,6 +3341,8 @@ static void time_report(Job *j, double wall, int threads) {
            j->wait_mem, j->wait_dev, j->cpu > 0 && j->busy > j->cpu ? j->busy - j->cpu : 0);
     Seg *m = &j->seg[j->tmax_seg];
     printf("\n    slowest segment: %.1f s (%s, %.1f MiB)\n", j->tmax, TYPES[type_index(m->type)].name, m->size / 1048576.0);
+    if (G.segs) printf("    gpu: %" PRIu64 " segments (%" PRIu64 " chunks) in %.2f s, kernels %.2f s; %" PRIu64 " -g segments on the CPU (GPU busy)\n", G.segs, G.chunks, G.secs, G.ksecs, G.cpusegs);
+    if (G.chksegs) printf("    gpu check: %" PRIu64 " of %" PRIu64 " segments differ from the CPU\n", G.badsegs, G.chksegs);
     printf("  memory: peak about %.0f MiB for segments, up to %d at once\n", MiB(j->peak), j->max_inflight);
 }
 static const uint8_t *map_file(const char *path, size_t *n) {
@@ -2599,7 +3398,7 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
         printf("note: %.*f MiB of %s tensors, a type tenz has no model for: stored as they are\n", MiB(g_unmodelled[t]) < 0.1 ? 3 : 1, MiB(g_unmodelled[t]), ggml_name(t));
     Job j; memset(&j, 0, sizeof j);
     j.mode = test ? 2 : 0; j.seg = s; j.n = ns; j.in = p; j.fd = -1; j.phase = 1; j.quick = quick;
-    if (quick) printf("quick (-q): Q4_K, Q5_K, Q4_0, Q8_0 and floats in faster models, at a small cost in size\n");
+    if (quick) printf("quick (-q): Q4_K, Q5_K, Q4_0, Q8_0, floats and metadata strings in faster models, at a small cost in size\n");
     if (hsym) printf("-H: no longer needed, every block header is coded as symbols (ignored)\n");
     threads = plan_memory(&j, threads, limit);
     j.clen = calloc(ns + 1, 8); j.coff = calloc(ns + 1, 8);
@@ -2702,7 +3501,7 @@ static void cmd_decompress(const char *in, const char *out, int threads, uint64_
         if (type_index(s[i].type) < 0 || !s[i].ne0) die("corrupt header");
         {   uint32_t md = s[i].model & 255;
             if (md != M_NORMAL && md != M_RAW && !(md == M_LATTICE && s[i].type == T_Q6K) &&
-                !(md == M_QUICK && has_quick(s[i].type))) die("corrupt header");
+                !(md == M_QUICK && has_quick(s[i].type)) && !(md == M_GPU && s[i].type == T_Q4K)) die("corrupt header");
             if (s[i].model >> 8) die("corrupt header"); }
         s[i].size = seg_bytes(&s[i]); pos += ENTRY;
         if (coff[i] > n || clen[i] > n - coff[i] || s[i].off > orig || s[i].size > orig - s[i].off) die("corrupt header");
@@ -2763,16 +3562,17 @@ int main(int argc, char **argv) {
     if (argc < 3) {
         fprintf(stderr,
             "usage: tenz c in [out.tenz] [-t threads]"
-            " [-s segment_MiB] [-m MiB] [-q] [-f]\n"
+            " [-s segment_MiB] [-m MiB] [-q] [-g] [-f]\n"
             "       tenz d in.tenz [out] [-t threads]"
             " [-m MiB] [-f]\n"
             "       tenz t in [-t threads] [-s segment_MiB]"
-            " [-m MiB] [-q]   (round-trip test, no files)\n"
+            " [-m MiB] [-q] [-g]   (round-trip test, no files)\n"
             "       tenz v   (version)\n"
             "  out defaults to in + .tenz (c) or in without"
             " .tenz (d); -f overwrites an existing file\n"
-            "  -q: quick, Q4_K, Q5_K, Q4_0, Q8_0 and floats"
+            "  -q: quick, Q4_K, Q5_K, Q4_0, Q8_0, floats, strings"
             " in faster models (a little larger)\n"
+            "  -g: experimental, Q4_K decodable on a GPU (OpenCL)\n"
             "  defaults: all cores, segments of 1/24 of the"
             " file (8 to 48 MiB); memory: what is free,\n"
             "  minus a reserve for the device (15%% of RAM,"
@@ -2804,6 +3604,9 @@ int main(int argc, char **argv) {
             hsym = 1;
         } else if (!strcmp(a, "-q")) {
             quick = 1;
+        } else if (!strcmp(a, "-g")) {
+            G_GPUENC = 1;
+            const char *e = getenv("TENZ_GC"); if (e && atoi(e) > 0 && atoi(e) <= 4096) KQG_C = atoi(e);
         } else if (a[0] == '-' && a[1]) {
             fprintf(stderr, "tenz: unknown option %s\n", a);
             return 1;

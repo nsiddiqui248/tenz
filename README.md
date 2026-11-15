@@ -4,7 +4,7 @@
 
 tenz parses the GGUF file, unpacks each tensor's blocks into the real quantized values and their scales, and codes them with context models fitted to the data itself, using rANS and a range coder. Quantized values are coded as whole symbols (Q8_0 and floats as 4-bit symbols) from static tables: the compressor counts the whole file first and stores one shared seed table per type, and each segment stores only how its tables differ from the seed. Decompression therefore learns nothing. Metadata and padding are coded with a byte-level context-mixing model; tensors of types tenz has no model for are stored as they are. Nothing depends on the model's name or architecture. Safetensors files (F32, F16, BF16 tensors) are parsed the same way.
 
-> Status: **0.23, pre-release** (file format 23). The file format may change before 1.0; a `.tenz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)). Changes per version: [CHANGELOG.md](CHANGELOG.md).
+> Status: **0.25, pre-release** (file format 25). The file format may change before 1.0; a `.tenz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
 ## Results
 
@@ -17,6 +17,7 @@ All measurements were made on a **Poco F5**, a mid-range Android phone, in Termu
 | Qwen2.5-7B-Instruct | Q4_K_M | 4466.1 | **4111.0** | 7.95% | 81 s | 0.12 |
 | Qwen3-0.6B | Q8_0 | 609.8 | **563.9** | 7.54% | 11 s | 0.13 |
 | Gemma-4-31B-it (QAT) | Q4_0 | 16833.3 | **14694.9** | 12.70% | 258 s | 0.20 |
+| Qwen3-4B | Q3_K_M | 1979.5 | **1850.4** | 6.52% | 16.8 s (3 threads, `-q`) | 0.24 |
 
 Later versions change the older rows' sizes by about 0.1 MiB and run faster: Qwen3.5-2B took 58 s with 0.9, 24 s with 0.14 and 17 s with 0.20. [CHANGELOG.md](CHANGELOG.md) has the results of each version.
 
@@ -112,8 +113,9 @@ Their ceilings are for coding each byte on its own distribution ("marginal"). te
 
 | Tensor type | Model |
 |---|---|
-| Q4_K, Q5_K | Whole blocks from static tables (seed per file, differences per segment), coded with rANS in 4 interleaved lanes. Values as whole symbols, one sub-block per lane; contexts: the sub-block's zero point, extremes seen (0 and max), position. With `-q`, the zero point alone, decoded by one table lookup per value. Headers one block per lane: d and dmin as four 4-bit symbols each (like the floats), scales and mins as a 2-bit and a 4-bit symbol (scale given the previous scale, min given its scale and the previous min). |
+| Q4_K, Q5_K | Whole blocks from static tables (seed per file, differences per segment), coded with rANS in 4 interleaved lanes. Values as whole symbols, one sub-block per lane; contexts: the sub-block's zero point, extremes seen (0 and max), position. With `-q`, the zero point alone; Q4_K then codes two values per symbol (256 symbols), decoded by one table lookup per pair. Headers one block per lane: d and dmin as four 4-bit symbols each (like the floats), scales and mins as a 2-bit and a 4-bit symbol (scale given the previous scale, min given its scale and the previous min). |
 | Q6_K | Whole blocks from static tables, coded with rANS in 4 interleaved lanes (one block's header per lane, 4 sub-blocks of each block per lane), in streams of 2048 blocks. Values as whole symbols; context: the column's running offset and width (mean and spread in units of the sub-block's step), position, extremes seen. Header: d as four 4-bit symbols, each scale as two (the low one given the high one and the whole previous scale). Or, if smaller, the AWQ lattice model for models converted from 4-bit AWQ/GPTQ checkpoints or trained for quantization: per 16-value sub-block the lattice size and span, then per value its lattice step (given the lattice size and its column's sign share and average step size over the rows above) and the error, with the same headers, its own static tables and lanes over consecutive sub-blocks. |
+| Q3_K | Whole blocks from static tables, coded with rANS in 4 interleaved lanes (one block's header per lane, 4 of its 16 sub-blocks per lane). Values in pairs (two adjacent 3-bit values as one symbol of 64) given only the size of their sub-block's scale, decoded by one table lookup per pair: on Qwen3-4B Q3_K_M, 15 richer contexts (column statistics, extremes seen, position, neighbours) would gain at most 0.013 bits per value. Header: d as four 4-bit symbols, each 6-bit scale as a 2-bit and a 4-bit symbol, as Q4_K's. |
 | Q4_0 | Whole blocks from static tables, coded with rANS in 4 interleaved lanes (one block per lane). Values as 4-bit symbols; contexts: the column's share of positive weights so far, whether the block's extreme (q = 0) was seen, the average distance from the centre so far, position. The scale d as four 4-bit symbols, like the floats. |
 | Q8_0 | Whole blocks from static tables, coded with rANS in 4 interleaved lanes (one block per lane). Values as two 4-bit symbols (high nibble, then low nibble given the high one); context: the column's sign bias, extremes seen, average magnitude so far in the block. The scale d as four 4-bit symbols given the previous block's d. |
 | F32, F16, BF16 | Each 16 bits as four 4-bit symbols from static tables: sign, exponent and top mantissa bits each given the ones above (the first also given an earlier value); the low mantissa bits with little context, since they are close to random in trained weights. F32's low 16 bits the same way. Coded with rANS in 4 interleaved lanes: decoding needs no division, and the CPU works on 4 values at once. |
@@ -136,7 +138,7 @@ One C file, no dependencies.
 gcc -O2 -pthread -ffp-contract=off -o tenz tenz.c -lm
 ```
 
-clang works with the same flags, including on Termux. 32-bit x86 also needs `-msse2 -mfpmath=sse`.
+clang works with the same flags, including on Termux. 32-bit x86 also needs `-msse2 -mfpmath=sse`. On Linux with glibc older than 2.34, add `-ldl` (OpenCL for `-g` is loaded at run time).
 
 Supported platforms: Linux, Android (Termux), macOS, BSD. Windows: use WSL, since tenz needs POSIX `mmap` and `pwrite`.
 
@@ -157,7 +159,8 @@ Options can go anywhere on the line:
 | `-t N` | threads (default: all cores) |
 | `-s MiB` | segment size (default: 1/24 of the file, 8 to 48 MiB); lower uses less memory |
 | `-m MiB` | memory limit for tenz, instead of the automatic one |
-| `-q` | quick: faster models for Q4_K, Q5_K, Q4_0, Q8_0 and floats, at a small cost in size. Measured: Qwen3.5-2B Q4_K_M 8.18% instead of 8.54% saved (Q4_K, Q5_K work about 35% less); Llama-3.2-1B Q8_0 7.82% instead of 8.27% (Q8_0 work 14% less); Llama-3.2-1B BF16 34.19% instead of 34.25% (BF16 work about 8–27% less). Gemma-4-31B Q4_0 12.19% instead of 12.70% (Q4_0 work 21% less). Float segments stay normal where the shortcut would cost more than 1%. Recorded per segment, so `tenz d` needs no option |
+| `-q` | quick: faster models for Q4_K, Q5_K, Q4_0, Q8_0, floats and the metadata strings (orders 0 and 1 of the byte model only), at a small cost in size. Measured: Qwen3.5-2B Q4_K_M 8.18% instead of 8.54% saved (Q4_K work about 44% less, Q5_K about 33%); Llama-3.2-1B Q8_0 7.82% instead of 8.27% (Q8_0 work 14% less); Llama-3.2-1B BF16 34.19% instead of 34.25% (BF16 work about 8–27% less). Gemma-4-31B Q4_0 12.19% instead of 12.70% (Q4_0 work 21% less). Metadata strings, Qwen3.5-2B: 1.9 → 2.2 MiB in 63% less time. Float segments stay normal where the shortcut would cost more than 1%. Recorded per segment, so `tenz d` needs no option |
+| `-g` | experimental: Q4_K coded so that a GPU can decode it (OpenCL, loaded at run time by `tenz d`; no build dependency). Chunks of 1024 blocks, each decoded by 64 GPU threads sharing one stream; the CPU decodes the same files, and takes segments while the GPU is busy. On a phone GPU (Adreno 725) it decodes Q4_K about as fast as 3 big cores with `-q`, at 0.1–0.2 points less saved, so it is meant for faster GPUs. The first GPU segment is always checked against the CPU. `TENZ_GPU=0` CPU only, `TENZ_GPU=2` GPU only, `TENZ_GPU_CHECK=1` check every segment |
 | `-f` | overwrite an existing output file |
 
 tenz never overwrites a file unless `-f` is given, and never writes over its own input.
@@ -195,24 +198,9 @@ tenz reads the safetensors header and codes F32, F16 and BF16 tensors with its f
 
 The byte model alone, without the float models, gave 171.9 MiB for both small files. The F32 file holds the same BF16 values with 16 zero bits added, and those cost almost nothing. As with GGUF, the gain on floats comes from the sign and exponent: the low mantissa bits of trained weights are close to random.
 
-### Other files
-
-Any other file is coded with the byte model alone. These file types were investigated during development; full details, including methods and every measurement, are in [docs/FINDINGS.md](docs/FINDINGS.md).
-
-| File | xz -9 | Byte model | Note |
-|---|---|---|---|
-| C++ source, 1.4 MiB | 128 KiB | 113 KiB | about 12% smaller than xz |
-| Python source corpus, 1.75 MB | 334,460 B | 298,333 B | 10.8% smaller than xz |
-| APK, 73.4 MiB | about 69 MB | 70.2 MiB (4.4% saved) | xz wins: APK contents are already deflated |
-| PDF, 1.4 MiB | | 2.4% saved | its streams are Flate-compressed |
-| 16-bit numeric samples, 1 MB | 60,516 B | about 122,100 B | xz wins: long repeats favour LZ |
-| JPEG | 0% | about 1% | already entropy-coded |
-
-The byte model is strong on text and source code, about 6–12% better than xz. It cannot shrink data that is already compressed, and nothing can without parsing the format first.
-
 ## Limitations
 
-- **Supported tensor types:** Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, F32, F16 and BF16. GGUF tensors of other types (IQ quants, Q2_K, Q3_K, Q4_1, Q5_0...) are stored as they are, and tenz says so at the start: the byte model would gain a few percent at most on them and take hours on a large model. Safetensors tensors of other types (F8, integers) still go to the byte model.
+- **Supported tensor types:** Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q8_0, F32, F16 and BF16. GGUF tensors of other types (IQ quants, Q2_K, Q4_1, Q5_0...) are stored as they are, and tenz says so at the start: the byte model would gain a few percent at most on them and take hours on a large model. Safetensors tensors of other types (F8, integers) still go to the byte model.
 - **Speed:** on the Poco F5 with 8 threads, Qwen3.5-2B (1.2 GB) compresses in about 7 s and decompresses in about 7 s (0.22). That is far slower than zstd decompresses, because each value is decoded from a context model, every tensor type in 4 interleaved rANS lanes without division. `-q` makes most types faster at a small cost in size. Metadata goes through the slower byte model, in pieces so that it runs in parallel.
 - **Format:** pre-1.0, so it may change between versions.
 

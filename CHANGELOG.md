@@ -1,10 +1,19 @@
 # Changelog
 
-The version and the file format share one number: tenz 0.23 writes and reads format 23 (magic `TENZ23`). Until 1.0, a `.tenz` file only decompresses with the version that made it. Versions up to 0.15 were released as foldz; a `.foldz` file needs the foldz version that made it.
+The version and the file format share one number: tenz 0.25 writes and reads format 25 (magic `TENZ25`). Until 1.0, a `.tenz` file only decompresses with the version that made it. Versions up to 0.15 were released as foldz; a `.foldz` file needs the foldz version that made it.
 
 Each section becomes the release notes when its tag (for example `v0.23`) is pushed; see `.github/workflows/release.yml`.
 
 ## [Unreleased]
+
+## [0.25] - 2026-11-15
+- Experimental `-g`: Q4_K coded so that a GPU can decode it (OpenCL, loaded at run time); on an Adreno 725 about as fast as the CPU with `-q`, so meant for faster GPUs. Without `-g`, everything is coded as in 0.24.
+
+## [0.24] - 2026-11-15
+- Q3_K support (Q3_K_S/M/L files): whole blocks in rANS lanes, values in pairs (one symbol per two values) given the size of their scale, decoded by table lookup. Qwen3-4B Q3_K_M: Q3_K about 5.4% saved, file about 6.7%.
+- `-q` Q4_K values in pairs (one symbol per two values): half the decoding steps, same size.
+- `-q` metadata strings with the byte model's orders 0 and 1 only: 63% less time on them, +0.3 MiB on Qwen3.5-2B.
+- `-q` Q4_K codes two values per symbol: half the decoding steps, about 14% less Q4_K work on the phone (`t`), same size.
 
 ## [0.23] - 2026-11-14
 - New option `-q` (quick): faster models for Q4_K, Q5_K, Q4_0, Q8_0 and floats, a fraction of a point less saved (Qwen3.5-2B Q4_K_M 8.54% → 8.18%, Llama-3.2-1B Q8_0 8.27% → 7.82%, BF16 34.25% → 34.19%, Gemma-4-31B Q4_0 12.70% → 12.19%). Recorded per segment.
