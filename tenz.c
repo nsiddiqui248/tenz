@@ -101,6 +101,8 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <dirent.h>
+#include <errno.h>
 #include <time.h>
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -110,15 +112,15 @@
 #include <sys/sysctl.h>
 #endif
 
-#define TENZ_VERSION "0.25"
-#define TENZ_FORMAT "25"                               /* the number in MAGIC */
+#define TENZ_VERSION "0.26"
+#define TENZ_FORMAT "26"                               /* the number in MAGIC */
 #define KQ_LANES 4                     /* rANS lanes of Q4_K and Q5_K (8 was measured: no faster) */
-static const char MAGIC[8] = {'T','E','N','Z','2','4','\n', 0};    /* file format 24 */
+static const char MAGIC[8] = {'T','E','N','Z','2','6','\n', 0};    /* file format 26 */
 /* T_M32: a GGUF metadata array of 32-bit values, coded as F32; T_STRS: whole records of a GGUF
    string array; T_BYTES: everything else outside the tensors */
 enum { T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q8_0 = 8, T_Q3K = 11, T_Q4K = 12, T_Q5K = 13, T_Q6K = 14, T_BF16 = 30,
        T_M32 = 0xFFFD, T_STRS = 0xFFFE, T_BYTES = 0xFFFF };
-enum { M_NORMAL = 0, M_LATTICE = 1, M_QUICK = 2, M_GPU = 3, M_RAW = 255 };   /* M_GPU: -g Q4_K */
+enum { M_NORMAL = 0, M_LATTICE = 1, M_QUICK = 2, M_GPU = 3, M_DUP = 4, M_SEED = 5, M_RAW = 255 };   /* M_GPU: -g Q4_K; M_DUP: a copy of an earlier segment */
 static int G_GPUENC;                                  /* compress -g */
 static inline uint32_t fl_type(uint32_t t) { return t == T_M32 ? T_F32 : t; }   /* the float model's type */
 
@@ -2401,7 +2403,7 @@ HOT void strs_code_impl(Coder *c, const int dec, uint8_t *data, uint64_t n) {
 MODEL(strs_code, uint8_t *data X uint64_t n, data X n)
 
 /* ---------------- segments ---------------- */
-typedef struct { uint64_t off, size, ne0, rows; uint32_t type, model; } Seg;
+typedef struct { uint64_t off, size, ne0, rows; uint32_t type, model; uint64_t soff; uint32_t stype; } Seg;   /* soff, stype: M_SEED's seed rows */
 static uint64_t seg_bytes(const Seg *s) {                 /* untrusted on decompress: check everything */
     int ti = type_index(s->type); uint64_t a, b;
     if (ti < 0 || !s->ne0 || !s->rows || s->ne0 % TYPES[ti].vpb) die("corrupt index");
@@ -2438,23 +2440,25 @@ static void code_seg(Coder *c, Seg *s, uint8_t *p) {
 /* ---------------- static value tables ---------------- */
 /* types with static value tables (every tensor type, and metadata arrays of 32-bit values, which
    share F32's tables): index, symbols per context, contexts */
-#define NSTATIC 12                               /* 8: Q6_K lattice segments, 9: Q3_K, 10: quick Q4_K (pairs), 11: -g Q4_K */
+#define NSTATIC 16                               /* 8: Q6_K lattice segments, 9: Q3_K, 10: quick Q4_K (pairs), 11: -g Q4_K */
 static int kq_index(uint32_t type) {
     return type == T_Q4K ? 0 : type == T_Q5K ? 1 : type == T_Q6K ? 2 : type == T_Q8_0 ? 3 :
            type == T_BF16 ? 4 : type == T_F16 ? 5 : type == T_F32 || type == T_M32 ? 6 : type == T_Q4_0 ? 7 : type == T_Q3K ? 9 : -1;
 }
-static const int KQ_SYM[NSTATIC] = {16, 32, 64, 16, 16, 16, 16, 16, 64, 64, 256, 16},
-                 KQ_CTX[NSTATIC] = {32 * 36 + KH_CTX, 64 * 36 + KH_CTX, Q6_CTX + Q6H_CTX, Q8_CTX * 17 + Q8H_CTX, FL_HI, FL_HI, FL_HI + FL_LO, Q40_VCTX + FL_HI, Q6L_N + Q6H_CTX, Q3_VCTX + Q3H_CTX, KP_VCTX + KH_CTX, KQG_VCTX + KH_CTX};
+static const int KQ_SYM[NSTATIC] = {16, 32, 64, 16, 16, 16, 16, 16, 64, 64, 256, 16, 16, 32, 64, 64},
+                 KQ_CTX[NSTATIC] = {32 * 36 + KH_CTX, 64 * 36 + KH_CTX, Q6_CTX + Q6H_CTX, Q8_CTX * 17 + Q8H_CTX, FL_HI, FL_HI, FL_HI + FL_LO, Q40_VCTX + FL_HI, Q6L_N + Q6H_CTX, Q3_VCTX + Q3H_CTX, KP_VCTX + KH_CTX, KQG_VCTX + KH_CTX,
+                 32 * 36 + KH_CTX, 64 * 36 + KH_CTX, Q6_CTX + Q6H_CTX, Q3_VCTX + Q3H_CTX};   /* 12-15: seeded Q4_K, Q5_K, Q6_K, Q3_K (ranks) */
 /* segments coded with static tables: tensor types, not raw */
 /* types with a quick model (-q) */
 static int has_quick(uint32_t type) { return type == T_STRS || type == T_Q4K || type == T_Q5K || type == T_Q4_0 || type == T_Q8_0 || type == T_BF16 || type == T_F16 || type == T_F32; }
 static int is_static(const Seg *s) {
     int md = s->model & 255;
     return kq_index(s->type) >= 0 && (md == M_NORMAL || (md == M_LATTICE && s->type == T_Q6K) ||
-                                      (md == M_QUICK && has_quick(s->type)) || (md == M_GPU && s->type == T_Q4K));
+                                      (md == M_QUICK && has_quick(s->type)) || (md == M_GPU && s->type == T_Q4K) ||
+                                      (md == M_SEED && (s->type == T_Q4K || s->type == T_Q5K || s->type == T_Q6K || s->type == T_Q3K)));
 }
 /* the segment's table set: by type, and Q6_K lattice segments their own */
-static int tab_index(const Seg *s) { return s->type == T_Q4K && (s->model & 255) == M_GPU ? 11 : s->type == T_Q6K && (s->model & 255) == M_LATTICE ? 8 : s->type == T_Q4K && (s->model & 255) == M_QUICK ? 10 : kq_index(s->type); }
+static int tab_index(const Seg *s) { return (s->model & 255) == M_SEED ? (s->type == T_Q3K ? 15 : 12 + kq_index(s->type)) : s->type == T_Q4K && (s->model & 255) == M_GPU ? 11 : s->type == T_Q6K && (s->model & 255) == M_LATTICE ? 8 : s->type == T_Q4K && (s->model & 255) == M_QUICK ? 10 : kq_index(s->type); }
 static int is_kq45(uint32_t type) { return type == T_Q4K || type == T_Q5K; }
 /* static segments, all coded in rANS lanes: floats, K-quants (both Q6_K models), Q4_0, Q8_0 */
 static int is_rans(const Seg *s) { return is_static(s); }
@@ -2909,11 +2913,17 @@ static Seg *build_segments(uint64_t n, uint64_t seg_target, uint64_t nt, uint32_
     *nseg = cnt; return s;
 }
 /* ---------------- parallel driver ---------------- */
-/* container: magic | u64 orig size | u32 nseg
+/* container: magic | u64 total size | u32 nseg | u64 seed offset | u64 seed length | u32 members | u32 flags
+              | members x (u64 offset, u64 size, u16 name length, name)
               | nseg x (u64 off, u64 ne0, u64 rows, u32 type | model << 16, u64 clen, u64 coff)
-              | raw bytes between segments | coded segments at their coff */
+              | raw bytes between segments, member by member | seeds | coded segments at their coff
+   The members are the files of the input, at page-aligned offsets of one range (one file: offset 0);
+   a segment's offset is in that range. A copy of an earlier segment (M_DUP) has clen 0 and coff the
+   earlier segment's index. flags: 1 = the input was a folder (decompress makes one).
+   After the segments: u32 count, count x (u32 segment, u32 seed type, u64 seed offset): the segments
+   coded given a seed (M_SEED), with the seed's rows (in the range; decoded before them). */
 #define ENTRY 44
-#define HDR 36                                   /* magic, size, segments, seed offset, seed length */
+#define HDR 44
 typedef struct {
     int mode;                          /* 0 compress, 1 decompress, 2 test */
     Seg *seg; int n; int next, failed, done; int *order;
@@ -2932,6 +2942,9 @@ typedef struct {
     Seed seed[NSTATIC], dseed[NSTATIC];                        /* seed tables: built (compress), decoded (test, decompress) */
     uint16_t **ownf; uint32_t **ownN; uint64_t *held;   /* per segment, from pass 1 to pass 2 */
     pthread_cond_t cv;
+    /* the members (files) of the input or output, at their offsets in one address range; decompress:
+       an output descriptor each. dupf/dupn: per segment its first copy and the next copy (M_DUP) */
+    int nm, *mfd; uint64_t *mvoff, *msize; int *dupf, *dupn;
 } Job;
 
 static void pwrite_all(int fd, const void *p, uint64_t n, uint64_t at) {
@@ -3015,8 +3028,9 @@ static uint64_t model_bytes(const Seg *s) {
 /* peak memory of one segment: tables plus buffers. Compress: the coded output (Q6_K may code
    twice and keep the smaller). Test: output plus the decoded copy. Decompress: the decoded copy.
    Decoding Q5_K and Q6_K also holds a lookup table, half the size of a table set. */
+static uint64_t seed_bytes(const Seg *s);
 static uint64_t seg_need(const Seg *s, int mode, int phase) {
-    uint64_t z = s->size, slack = 1u << 20, mb = model_bytes(s);
+    uint64_t z = s->size, slack = (1u << 20) + ((s->model & 255) == M_SEED ? z + seed_bytes(s) : 0), mb = model_bytes(s);   /* seeded: the ranks, the seed's rows */
     int t = tab_index(s);
     uint64_t tab = t >= 0 ? (uint64_t)KQ_CTX[t] * KQ_SYM[t] * 2 : 0;          /* one table set, int16 */
     uint64_t lut = !uses_lut(s) ? 0 : s->type == T_Q6K ? (uint64_t)KQ_CTX[t] * Q6_LUTB : tab / 2;
@@ -3155,7 +3169,7 @@ static void static_rans_decode(Job *j, Seg *s, const uint8_t *in, size_t len, ui
 /* a coded segment: store raw if not smaller, then write it (compress) or check it (test) */
 static void finish_coded(Job *j, int i, Seg *s, Coder *c, const uint8_t *src) {
     const uint8_t *outp = c->buf;
-    if (c->pos >= s->size) { c->pos = s->size; outp = src; s->model = M_RAW; }   /* never larger: store raw */
+    if (c->pos >= s->size) { c->pos = s->size; outp = j->in + s->off; s->model = M_RAW; }   /* never larger: store raw (the original bytes, not ranks) */
     j->clen[i] = c->pos;
     if (j->mode == 0) {
         pthread_mutex_lock(&j->mu); uint64_t at = j->end; j->end += c->pos; pthread_mutex_unlock(&j->mu);
@@ -3174,6 +3188,48 @@ static void finish_coded(Job *j, int i, Seg *s, Coder *c, const uint8_t *src) {
     }
     free(c->buf); c->buf = NULL;
 }
+static void seed_transform(uint32_t t, uint8_t *B, uint64_t nb, uint32_t st, const uint8_t *seed, int dir);
+static int dq_vpb(uint32_t t); static int dq_bytes(uint32_t t);
+/* seeded types: block bytes, largest value (Q3_K: symbols 0..7, the value + 4) */
+static int tgt_bs(uint32_t t) { return t == T_Q6K ? 210 : t == T_Q4K ? 144 : t == T_Q5K ? 176 : 110; }
+static int tgt_L(uint32_t t) { return t == T_Q6K ? 63 : t == T_Q4K ? 15 : t == T_Q5K ? 31 : 7; }
+static uint64_t seed_bytes(const Seg *s) { int bs = tgt_bs(s->type), v = dq_vpb(s->stype), b = dq_bytes(s->stype);
+    return b ? s->size / bs * 256 / v * b : 0; }
+/* compress: a seeded segment as ranks (checked to come back) */
+static uint8_t *seed_ranks(Job *j, const Seg *s) {
+    int bs = tgt_bs(s->type); uint64_t nb = s->size / bs;
+    uint8_t *r = xmalloc(s->size), *back; memcpy(r, j->in + s->off, s->size);
+    seed_transform(s->type, r, nb, s->stype, j->in + s->soff, 0);
+    if (j->phase == 1) return r;                        /* pass 2 checks it */
+    back = xmalloc(s->size); memcpy(back, r, s->size); seed_transform(s->type, back, nb, s->stype, j->in + s->soff, 1);
+    if (memcmp(back, j->in + s->off, s->size)) die("internal: seed ranks do not come back");
+    free(back); return r;
+}
+static void mem_read(Job *j, void *b, uint64_t n, uint64_t voff);
+/* decompress: ranks back to values, from the seed's rows already written */
+static double g_seed_read, g_seed_xf;                  /* decompress: thread-seconds reading seed rows, turning ranks back */
+static void seed_values(Job *j, const Seg *s, uint8_t *buf) {
+    int bs = tgt_bs(s->type); uint64_t sb = seed_bytes(s); double t0 = now();
+    uint8_t *sd = xmalloc(sb ? sb : 1); mem_read(j, sd, sb, s->soff); double t1 = now();
+    seed_transform(s->type, buf, s->size / bs, s->stype, sd, 1); free(sd); double t2 = now();
+    pthread_mutex_lock(&j->mu); g_seed_read += t1 - t0; g_seed_xf += t2 - t1; pthread_mutex_unlock(&j->mu);
+}
+/* decompress: a segment's bytes to its member file, and to every copy of it (M_DUP) */
+static void mem_write(Job *j, const void *b, uint64_t n, uint64_t voff) {
+    int lo = 0, hi = j->nm - 1;
+    while (lo < hi) { int m = (lo + hi + 1) / 2; if (j->mvoff[m] <= voff) lo = m; else hi = m - 1; }
+    pwrite_all(j->mfd[lo], b, n, voff - j->mvoff[lo]);
+}
+static void mem_read(Job *j, void *b, uint64_t n, uint64_t voff) {
+    int lo = 0, hi = j->nm - 1;
+    while (lo < hi) { int m = (lo + hi + 1) / 2; if (j->mvoff[m] <= voff) lo = m; else hi = m - 1; }
+    uint8_t *q = b; uint64_t at = voff - j->mvoff[lo];
+    while (n) { ssize_t r = pread(j->mfd[lo], q, n > (1u << 30) ? 1u << 30 : n, (off_t)at); if (r <= 0) die("cannot read back a seed"); q += r; at += r; n -= r; }
+}
+static void seg_out(Job *j, int i, const void *b) {
+    mem_write(j, b, j->seg[i].size, j->seg[i].off);
+    for (int d = j->dupf ? j->dupf[i] : -1; d >= 0; d = j->dupn[d]) mem_write(j, b, j->seg[d].size, j->seg[d].off);
+}
 static void *worker(void *arg) {
     Job *j = arg;
     for (;;) {
@@ -3182,7 +3238,8 @@ static void *worker(void *arg) {
         Seg *s = &j->seg[i]; Coder c; double ts = now(), tc = thread_cpu();
         int t = j->phase == 2 || j->mode == 1 ? tab_index(s) : kq_index(s->type);   /* pass 1 picks the lattice */
         if (j->mode != 1) {
-            const uint8_t *src = j->in + s->off;
+            uint8_t *ranks = (s->model & 255) == M_SEED ? seed_ranks(j, s) : NULL;
+            const uint8_t *src = ranks ? ranks : j->in + s->off;
             if (j->phase == 2 && t >= 0) {                   /* static tables, then the values */
                 size_t tn = (size_t)KQ_CTX[t] * KQ_SYM[t];
                 int16_t *U = xmalloc(tn * 2);
@@ -3215,7 +3272,7 @@ static void *worker(void *arg) {
                 size_t tn = (size_t)KQ_CTX[t] * KQ_SYM[t];
                 uint32_t *cnt = calloc(tn, 4); if (!cnt) die("out of memory");
                 int fl = s->type == T_BF16 || s->type == T_F16 || s->type == T_F32;
-                s->model = G_GPUENC && s->type == T_Q4K ? M_GPU : j->quick && has_quick(s->type) && !fl ? M_QUICK : M_NORMAL;
+                if ((s->model & 255) != M_SEED) s->model = G_GPUENC && s->type == T_Q4K ? M_GPU : j->quick && has_quick(s->type) && !fl ? M_QUICK : M_NORMAL;
                 if (tab_index(s) != t) { t = tab_index(s); tn = (size_t)KQ_CTX[t] * KQ_SYM[t]; free(cnt); cnt = calloc(tn, 4); if (!cnt) die("out of memory"); }
                 { Coder cc; memset(&cc, 0, sizeof cc); cc.cnt = cnt; cc.cnt_only = 1; code_seg(&cc, s, (uint8_t *)src); }
                 if (j->quick && fl) {                        /* -q floats: only if uniform low nibbles cost under 1% */
@@ -3228,7 +3285,7 @@ static void *worker(void *arg) {
                     }
                     if (uni - mod <= 0.01 * all) s->model = M_QUICK;
                 }
-                if (s->type == T_Q6K && lattice_sample(src, s->size / 210) < 20) {
+                if (s->type == T_Q6K && (s->model & 255) != M_SEED && lattice_sample(src, s->size / 210) < 20) {
                     /* the lattice too: the model whose counts have the lower entropy (both static) */
                     size_t tn2 = (size_t)KQ_CTX[8] * KQ_SYM[8];
                     uint32_t *cnt2 = calloc(tn2, 4); if (!cnt2) die("out of memory");
@@ -3257,14 +3314,16 @@ static void *worker(void *arg) {
                 enc_init(&c, s->size); code_seg(&c, s, (uint8_t *)src); enc_flush(&c);
                 finish_coded(j, i, s, &c, src);
             }
+            free(ranks);
         } else if (s->model == M_RAW) {                      /* straight from the input, no buffer */
             if (j->clen[i] != s->size) die("corrupt file");
-            pwrite_all(j->fd, j->in + j->coff[i], s->size, s->off);
+            seg_out(j, i, j->in + j->coff[i]);
         } else {
             uint8_t *buf = xmalloc(s->size); int16_t *U = NULL;
             if (is_rans(s)) {
                 static_rans_decode(j, s, j->in + j->coff[i], j->clen[i], buf);
-                pwrite_all(j->fd, buf, s->size, s->off); free(buf);
+                if ((s->model & 255) == M_SEED) seed_values(j, s, buf);
+                seg_out(j, i, buf); free(buf);
                 goto seg_done;
             }
             dec_init(&c, j->in + j->coff[i], j->clen[i]);
@@ -3274,7 +3333,7 @@ static void *worker(void *arg) {
                 code_tables(&c, 1, &j->dseed[t], NULL, NULL, U); c.stt = U;
             }
             code_seg(&c, s, buf);
-            pwrite_all(j->fd, buf, s->size, s->off); free(buf); free(U);
+            seg_out(j, i, buf); free(buf); free(U);
         }
     seg_done:;
         double dt = now() - ts, dc = thread_cpu() - tc;
@@ -3387,15 +3446,352 @@ static void report(Seg *s, int n, uint64_t *clen, uint64_t total, uint64_t out_t
     printf("  file  %9.1f MiB -> %9.1f MiB  (%5.2f%% saved)\n", total / 1048576.0, out_total / 1048576.0,
            100.0 * (1 - (double)out_total / total));
 }
-static void cmd_compress(const char *in, const char *out, int threads, uint64_t segb, int test, uint64_t limit, int hsym, int quick) {
-    size_t n; const uint8_t *p = map_file(in, &n);
-    /* -s not given: segments of n / 24, from 8 to 48 MiB (48 from about 1.1 GB on), so a small file has enough of them to keep
-       every thread busy to the end; by file size only, so a file splits the same way everywhere */
-    if (!segb) { segb = (uint64_t)n / 24 >> 20 << 20; if (segb < (8u << 20)) segb = 8u << 20; if (segb > (48u << 20)) segb = 48u << 20; }
-    int ns; Seg *s = find_segments(p, n, segb, &ns);
-    printf("%s: %.1f MiB, %d segments to code\n", in, n / 1048576.0, ns);
-    for (int t = 0; t <= NGGML; t++) if (g_unmodelled[t])
-        printf("note: %.*f MiB of %s tensors, a type tenz has no model for: stored as they are\n", MiB(g_unmodelled[t]) < 0.1 ? 3 : 1, MiB(g_unmodelled[t]), ggml_name(t));
+/* ---- members: the input files in one address range ---- */
+typedef struct { int nm, dir; const char **path; char **name; uint64_t *voff, *size; } Mem;
+static const char *base_name(const char *p) { const char *b = strrchr(p, '/'); return b ? b + 1 : p; }
+static const uint8_t *map_members(Mem *M, uint64_t *total) {
+    M->voff = calloc(M->nm, 8); M->size = calloc(M->nm, 8); M->name = calloc(M->nm, sizeof *M->name);
+    if (!M->voff || !M->size || !M->name) die("out of memory");
+    if (M->nm == 1 && !M->dir) {
+        size_t n; const uint8_t *p = map_file(M->path[0], &n);
+        M->size[0] = n; M->name[0] = strdup(base_name(M->path[0])); *total = n; return p;
+    }
+    uint64_t pg = (uint64_t)sysconf(_SC_PAGESIZE), at = 0; int *fd = calloc(M->nm, sizeof *fd);
+    for (int k = 0; k < M->nm; k++) {
+        fd[k] = open(M->path[k], O_RDONLY); struct stat st;
+        if (fd[k] < 0 || fstat(fd[k], &st)) { fprintf(stderr, "tenz: cannot open %s\n", M->path[k]); exit(1); }
+        if (!st.st_size) { fprintf(stderr, "tenz: %s is empty\n", M->path[k]); exit(1); }
+        M->voff[k] = at; M->size[k] = (uint64_t)st.st_size; M->name[k] = strdup(base_name(M->path[k]));
+        at += (M->size[k] + pg - 1) / pg * pg;
+    }
+    *total = at;
+    uint8_t *base = mmap(NULL, at + pg, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);   /* reserve the range */
+    if (base == MAP_FAILED) die("cannot reserve address space for the files (a 64-bit system is needed for big folders)");
+    for (int k = 0; k < M->nm; k++) {
+        void *q = mmap(base + M->voff[k], M->size[k], PROT_READ, MAP_PRIVATE | MAP_FIXED, fd[k], 0);
+        if (q == MAP_FAILED) die("cannot map input");
+        close(fd[k]);
+    }
+    free(fd);
+    *total = M->voff[M->nm - 1] + M->size[M->nm - 1];
+    return base;
+}
+/* the bytes between segments, member by member, in order */
+typedef void (*GapFn)(void *ctx, uint64_t a, uint64_t b);
+static void for_gaps(const Seg *s, int ns, int nm, const uint64_t *voff, const uint64_t *size, GapFn fn, void *ctx) {
+    int i = 0;
+    for (int k = 0; k < nm; k++) {
+        uint64_t at = voff[k], end = voff[k] + size[k];
+        while (i < ns && s[i].off < end) { if (s[i].off < at) die("corrupt header"); fn(ctx, at, s[i].off); at = s[i].off + s[i].size; i++; }
+        if (at > end) die("corrupt header");
+        fn(ctx, at, end);
+    }
+    if (i < ns) die("corrupt header");
+}
+typedef struct { int fd; const uint8_t *p; uint64_t w, sum; } GapW;
+static void gap_write(void *c, uint64_t a, uint64_t b) { GapW *g = c; if (g->fd >= 0) pwrite_all(g->fd, g->p + a, b - a, g->w); g->w += b - a; g->sum += b - a; }
+/* identical segments, e.g. the same tensors in two quantizations of one model: the later ones
+   become copies (M_DUP) of the first, by size, type, a hash, then the bytes themselves */
+static uint64_t seg_hash(const uint8_t *p, uint64_t n) {
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ n, a = 0, b = 0; uint64_t i = 0;
+    for (; i + 16 <= n; i += 16) { uint64_t x, y; memcpy(&x, p + i, 8); memcpy(&y, p + i + 8, 8);
+        a = (a ^ x) * 0xff51afd7ed558ccdull; a ^= a >> 29; b = (b ^ y) * 0xc4ceb9fe1a85ec53ull; b ^= b >> 31; }
+    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+    return h ^ a ^ (b << 1) ^ (b >> 63);
+}
+static Seg *SORT_DUP;
+static int cmp_dupkey_eq(const Seg *a, const Seg *b) { return a->size != b->size || a->type != b->type || a->ne0 != b->ne0; }
+static int cmp_dupkey(const void *x, const void *y) {
+    const Seg *a = &SORT_DUP[*(const int *)x], *b = &SORT_DUP[*(const int *)y];
+    if (a->size != b->size) return a->size < b->size ? -1 : 1;
+    if (a->type != b->type) return a->type < b->type ? -1 : 1;
+    if (a->ne0 != b->ne0) return a->ne0 < b->ne0 ? -1 : 1;
+    return a->off < b->off ? -1 : a->off > b->off;
+}
+static int find_dups(Seg *s, int ns, const uint8_t *p, int *dupof, uint64_t *bytes) {
+    int *ix = xmalloc((ns + 1) * sizeof *ix), m = 0, nd = 0; *bytes = 0;
+    for (int i = 0; i < ns; i++) { dupof[i] = -1; if (s[i].type != T_BYTES && s[i].size >= 4096) ix[m++] = i; }
+    SORT_DUP = s; qsort(ix, m, sizeof *ix, cmp_dupkey);
+    uint64_t *h = xmalloc((ns + 1) * 8);
+    for (int a = 0; a < m;) {
+        int b = a + 1; while (b < m && !cmp_dupkey_eq(&s[ix[a]], &s[ix[b]])) b++;
+        if (b - a > 1) {
+            for (int q = a; q < b; q++) h[q] = seg_hash(p + s[ix[q]].off, s[ix[q]].size);
+            for (int q = a + 1; q < b; q++) for (int r = a; r < q; r++)        /* ix ascending by offset: the first copy wins */
+                if (dupof[ix[r]] < 0 && h[r] == h[q] && !memcmp(p + s[ix[r]].off, p + s[ix[q]].off, s[ix[q]].size)) {
+                    dupof[ix[q]] = ix[r]; s[ix[q]].model = M_DUP; nd++; *bytes += s[ix[q]].size; break; }
+        }
+        a = b;
+    }
+    free(ix); free(h); return nd;
+}
+/* ---- seeds: a tensor coded given the same tensor in another file of the folder ----
+   Two files of one model (two quantizations, or a fine-tune and its base) hold nearly the same
+   weights. For a Q4_K, Q5_K or Q6_K tensor, the other file's version (the seed, any type tenz can
+   dequantize) predicts each value: its weight, put on this block's own scale and min, rounded.
+   Each value is then replaced by its rank among the candidates in order of closeness to the
+   prediction (the prediction 0, then the next level on the side the weight lies, 1, then the other
+   side, 2, ...): a bijection of 0..L, so the block keeps its form and the type's coder codes it,
+   with its own table set (most ranks are 0 or 1). Headers are left as they are. Decompress: the
+   seeds' segments first, then the seeded ones, which read their seed's rows from the output. */
+enum { SEED_MIN_GAIN_MILLI = 300 };               /* b/w a seed must save over the values' plain entropy */
+static int seed_can_target(uint32_t t) { return t == T_Q4K || t == T_Q5K || t == T_Q6K || t == T_Q3K; }
+static int dq_vpb(uint32_t t) { return t == T_Q8_0 || t == T_Q4_0 ? 32 : t == T_F32 || t == T_F16 || t == T_BF16 ? 1 : 256; }
+static int dq_bytes(uint32_t t) {
+    return t == T_Q3K ? 110 : t == T_Q4K ? 144 : t == T_Q5K ? 176 : t == T_Q6K ? 210 : t == T_Q8_0 ? 34 : t == T_Q4_0 ? 18 :
+           t == T_F32 ? 4 : t == T_F16 || t == T_BF16 ? 2 : 0;
+}
+static void q3_syms(const uint8_t *B, uint8_t *q); static void q3_scales(const uint8_t *B, int8_t *scl);
+/* one block (dq_vpb values) of a seed type to weights, as ggml dequantizes */
+static void seed_dequant(uint32_t t, const uint8_t *b, float *y) {
+    if (t == T_Q4K || t == T_Q5K) {
+        int sc[8], mn[8]; uint8_t q[256]; k_unpack_scales(b + 4, sc, mn); k_unpack_vals(b, t == T_Q4K ? 4 : 5, q);
+        float d = h2f(rd16(b)), dm = h2f(rd16(b + 2));
+        for (int i = 0; i < 256; i++) { float a = d * (float)sc[i >> 5], c = dm * (float)mn[i >> 5]; y[i] = a * (float)q[i] - c; }
+    } else if (t == T_Q6K) {
+        uint8_t q[256]; q6_unpack(b, q); float d = h2f(rd16(b + 208));
+        for (int i = 0; i < 256; i++) y[i] = d * (float)(int8_t)b[192 + 8 * (i >> 7) + ((i & 127) >> 4)] * (float)((int)q[i] - 32);
+    } else if (t == T_Q8_0) { float d = h2f(rd16(b)); for (int i = 0; i < 32; i++) y[i] = d * (float)(int8_t)b[2 + i]; }
+    else if (t == T_Q4_0) { float d = h2f(rd16(b)); for (int i = 0; i < 16; i++) { y[i] = d * (float)((b[2 + i] & 15) - 8); y[i + 16] = d * (float)((b[2 + i] >> 4) - 8); } }
+    else if (t == T_F32) memcpy(y, b, 4);
+    else if (t == T_F16) y[0] = h2f(rd16(b));
+    else if (t == T_BF16) { uint32_t u = (uint32_t)rd16(b) << 16; memcpy(y, &u, 4); }
+    else if (t == T_Q3K) {                               /* symbols, then a multiply each: as ggml's d * (scale - 32) * (q - 4) */
+        int8_t scl[16]; uint8_t sy[256]; q3_scales(b, scl); q3_syms(b, sy); float d = h2f(rd16(b + 108));
+        for (int k = 0; k < 16; k++) { float dl = d * (float)scl[k]; for (int l = 0; l < 16; l++) y[16 * k + l] = dl * (float)((int)sy[16 * k + l] - 4); }
+    }
+}
+/* the seed's weights for one 256-value block of the target (element e0 on) */
+static void seed_weights(uint32_t st, const uint8_t *seed, uint64_t e0, float *x) {
+    int v = dq_vpb(st), bb = dq_bytes(st); float tmp[256];
+    if (v == 256) { seed_dequant(st, seed + e0 / 256 * bb, x); return; }
+    for (int i = 0; i < 256; i += v) {
+        uint64_t e = e0 + (uint64_t)i;
+        if (v == 1) { seed_dequant(st, seed + e * bb, x + i); continue; }
+        seed_dequant(st, seed + (e / v) * bb, tmp); memcpy(x + i, tmp, (size_t)v * sizeof *x);
+    }
+}
+/* the prediction of a block's values from weights: per sub-block (32 values in Q4_K/Q5_K, 16 in
+   Q6_K) a reciprocal step and an offset, r = (x + off) * inv (Q6_K: x * inv + 32), p = r rounded half
+   up into 0..L, up = r >= p. Plain float arithmetic in a fixed order (-ffp-contract=off), the same on
+   every machine; a sub-block without a usable step predicts its midpoint (Q6_K) or 0 */
+/* Q3_K: value i (-4..3) as symbol 0..7: its 2 low bits in qs, its high bit in hmask (set: no -4) */
+static void q3_syms(const uint8_t *B, uint8_t *q) {    /* 16 values at a time, one shift each (vectorized) */
+    for (int n = 0; n < 2; n++) for (int j = 0; j < 4; j++) for (int h = 0; h < 2; h++) {
+        const uint8_t *qs = B + 32 + 32 * n + 16 * h, *hm = B + 16 * h; uint8_t *o = q + 128 * n + 32 * j + 16 * h; int sh = 2 * j, hb = 4 * n + j;
+        for (int l = 0; l < 16; l++) o[l] = (uint8_t)(((qs[l] >> sh) & 3) | (((hm[l] >> hb) & 1) << 2));
+    }
+}
+static void q3_put(uint8_t *B, const uint8_t *q) {
+    memset(B, 0, 96);
+    for (int n = 0; n < 2; n++) for (int j = 0; j < 4; j++) for (int h = 0; h < 2; h++) {
+        uint8_t *qs = B + 32 + 32 * n + 16 * h, *hm = B + 16 * h; const uint8_t *v = q + 128 * n + 32 * j + 16 * h; int sh = 2 * j, hb = 4 * n + j;
+        for (int l = 0; l < 16; l++) { qs[l] |= (uint8_t)((v[l] & 3) << sh); hm[l] |= (uint8_t)(((v[l] >> 2) & 1) << hb); }
+    }
+}
+static void q3_scales(const uint8_t *B, int8_t *scl) {        /* 16 signed scales, as ggml unpacks them */
+    uint32_t a[4]; memcpy(a, B + 96, 12); uint32_t tmp = a[2], k1 = 0x03030303, k2 = 0x0f0f0f0f;
+    a[2] = ((a[0] >> 4) & k2) | (((tmp >> 4) & k1) << 4); a[3] = ((a[1] >> 4) & k2) | (((tmp >> 6) & k1) << 4);
+    a[0] = (a[0] & k2) | (((tmp >> 0) & k1) << 4); a[1] = (a[1] & k2) | (((tmp >> 2) & k1) << 4);
+    memcpy(scl, a, 16); for (int k = 0; k < 16; k++) scl[k] = (int8_t)(scl[k] - 32);
+}
+typedef struct { float inv[16], off[16]; uint8_t ok[16]; int L, sh, q6; } SPred;
+static void spred_init(SPred *P, uint32_t t, const uint8_t *B) {
+    P->q6 = t == T_Q6K || t == T_Q3K;                  /* signed steps: x * inv + the midpoint */
+    if (t == T_Q3K) {
+        int8_t scl[16]; q3_scales(B, scl); float d = h2f(rd16(B + 108)); P->L = 7; P->sh = 4;
+        for (int k = 0; k < 16; k++) { float st = d * (float)scl[k]; P->ok[k] = st != 0 && st - st == 0; P->inv[k] = P->ok[k] ? 1.0f / st : 0; P->off[k] = 4.0f; }
+    } else if (t == T_Q6K) {
+        float d = h2f(rd16(B + 208)); P->L = 63; P->sh = 4;
+        for (int k = 0; k < 16; k++) { float st = d * (float)(int8_t)B[192 + k]; P->ok[k] = st != 0 && st == st && st - st == 0; P->inv[k] = P->ok[k] ? 1.0f / st : 0; P->off[k] = 32.0f; }
+    } else {
+        int sc[8], mn[8]; k_unpack_scales(B + 4, sc, mn); float d = h2f(rd16(B)), dm = h2f(rd16(B + 2)); P->L = t == T_Q4K ? 15 : 31; P->sh = 5;
+        for (int k = 0; k < 8; k++) { float st = d * (float)sc[k]; P->ok[k] = st > 0 && st - st == 0; P->inv[k] = P->ok[k] ? 1.0f / st : 0; P->off[k] = dm * (float)mn[k]; }
+    }
+}
+/* all 256 predictions of a block: the same arithmetic as spred, as selects in plain loops (vectorized) */
+static void spred_block(const SPred *P, const float *x, uint8_t *p, uint8_t *up) {
+    int n = 1 << P->sh, L = P->L, mid = P->q6 ? (L + 1) / 2 : 0; float hiL = (float)L + 1.0f;
+    for (int k = 0; k < 256 >> P->sh; k++) {
+        float inv = P->inv[k], off = P->off[k]; int ok = P->ok[k]; const float *xs = x + k * n; uint8_t *ps = p + k * n, *us = up + k * n;
+        for (int i = 0; i < n; i++) {
+            float xv = xs[i], r = P->q6 ? xv * inv + off : (xv + off) * inv;
+            r = r >= -1.0f ? r : -1.0f; r = r <= hiL ? r : hiL;          /* NaN: -1 (and then the midpoint below) */
+            int q = (int)(r + 1.5f) - 1; q = q < 0 ? 0 : q; q = q > L ? L : q;
+            int u = r >= (float)q, bad = !ok | (xv != xv);
+            ps[i] = (uint8_t)(bad ? mid : q); us[i] = (uint8_t)(bad | u);
+        }
+    }
+}
+static inline int spred(const SPred *P, int i, float x, int *up) {
+    int k = i >> P->sh;
+    if (!P->ok[k] || x != x) { *up = 1; return P->q6 ? (P->L + 1) / 2 : 0; }
+    float r = P->q6 ? x * P->inv[k] + P->off[k] : (x + P->off[k]) * P->inv[k];
+    if (!(r >= -1.0f)) r = -1.0f;                       /* NaN, too far: the ends */
+    if (!(r <= (float)P->L + 1.0f)) r = (float)P->L + 1.0f;
+    int p = (int)(r + 1.5f) - 1; if (p < 0) p = 0; if (p > P->L) p = P->L;
+    *up = r >= (float)p; return p;
+}
+/* rank of q among 0..L by closeness to p, the side up first; and back */
+static int seed_rank(int q, int p, int up, int L) {
+    int d = q - p; if (!d) return 0;
+    int m = d < 0 ? -d : d, below = m - 1 < p ? m - 1 : p, above = m - 1 < L - p ? m - 1 : L - p;
+    int second = up ? d < 0 : d > 0, first_ok = up ? p + m <= L : p - m >= 0;
+    return 1 + below + above + (second && first_ok);
+}
+static inline int seed_unrank(int r, int p, int up, int L) {
+    /* both sides have a = min(p, L - p) levels: ranks 1..2a alternate (odd: the side up says), the
+       ranks beyond walk the longer side; no loop, so no branch on the data in it */
+    int a = p < L - p ? p : L - p, dir = up ? 1 : -1;
+    if (r <= 2 * a) { int m = (r + 1) >> 1; return r & 1 ? p + dir * m : p - dir * m; }
+    int q = p + (p < L - p ? 1 : -1) * (r - a);
+    return q < 0 || q > L ? p : q;                      /* out of range: only for bad input */
+}
+/* seed_unrank on a block, as selects in one plain loop (vectorized) */
+static void seed_unrank_block(uint8_t *q, const uint8_t *pp, const uint8_t *uu, int L) {
+    for (int i = 0; i < 256; i++) {
+        int r = q[i], p = pp[i], d = uu[i] ? 1 : -1, lp = L - p, a = p < lp ? p : lp, m = (r + 1) >> 1;
+        int v1 = (r & 1) ? p + d * m : p - d * m, v2 = p + (p < lp ? 1 : -1) * (r - a);
+        int v = r <= 2 * a ? v1 : v2;
+        q[i] = (uint8_t)(v < 0 || v > L ? p : v);
+    }
+}
+/* a whole segment (n blocks of type t) to ranks (dir 0) or back (dir 1), given its seed rows */
+static void seed_transform(uint32_t t, uint8_t *B, uint64_t nb, uint32_t st, const uint8_t *seed, int dir) {
+    int bs = tgt_bs(t), L = tgt_L(t);
+    float x[256]; uint8_t q[256]; SPred P;
+    for (uint64_t k = 0; k < nb; k++, B += bs) {
+        seed_weights(st, seed, k * 256, x); spred_init(&P, t, B);
+        if (t == T_Q6K) q6_unpack(B, q); else if (t == T_Q3K) q3_syms(B, q); else k_unpack_vals(B, t == T_Q4K ? 4 : 5, q);
+        uint8_t pp[256], uu[256]; spred_block(&P, x, pp, uu);
+        if (dir) seed_unrank_block(q, pp, uu, L);
+        else for (int i = 0; i < 256; i++) q[i] = (uint8_t)seed_rank(q[i], pp[i], uu[i], L);
+        if (t == T_Q6K) q6_pack(B, q); else if (t == T_Q3K) q3_put(B, q); else k_pack_vals(B, t == T_Q4K ? 4 : 5, q);
+    }
+}
+/* plain and seeded entropy of a tensor's values on a sample of its blocks (bits per value, x1000) */
+static void seed_estimate(uint32_t t, const uint8_t *T, uint64_t nb, uint32_t st, const uint8_t *seed, int *plain, int *seeded) {
+    int bs = tgt_bs(t), L = tgt_L(t);
+    uint64_t cq[64] = {0}, cr[64] = {0}; uint64_t step = nb > 256 ? nb / 256 : 1;
+    float x[256]; uint8_t q[256]; SPred P;
+    for (uint64_t k = 0; k < nb; k += step) {
+        const uint8_t *B = T + k * bs; seed_weights(st, seed, k * 256, x); spred_init(&P, t, B);
+        if (t == T_Q6K) q6_unpack(B, q); else if (t == T_Q3K) q3_syms(B, q); else k_unpack_vals(B, t == T_Q4K ? 4 : 5, q);
+        for (int i = 0; i < 256; i++) { int up, p = spred(&P, i, x[i], &up); cq[q[i]]++; cr[seed_rank(q[i], p, up, L)]++; }
+    }
+    double hq = 0, hr = 0, N = 0; for (int v = 0; v <= L; v++) N += cq[v];
+    for (int v = 0; v <= L; v++) { if (cq[v]) hq -= cq[v] * log2(cq[v] / N); if (cr[v]) hr -= cr[v] * log2(cr[v] / N); }
+    *plain = (int)(1000 * hq / N); *seeded = (int)(1000 * hr / N);
+}
+/* the tensors of a GGUF file: name, type, first dimension, elements, offset in the address range */
+typedef struct { const char *name; uint32_t nl, type, mem; uint64_t ne0, ne, off; } TInfo;
+static TInfo *gguf_tensors(const uint8_t *p, uint64_t n, uint64_t voff, uint32_t mem, int *cnt) {
+    *cnt = 0; if (n < 24 || memcmp(p, "GGUF", 4)) return NULL;
+    Rd r = {p, n, 4}; uint32_t ver = ru32(&r); if (ver < 2) return NULL;
+    uint64_t nt = ru64(&r), nkv = ru64(&r), align = 32;
+    for (uint64_t i = 0; i < nkv; i++) {
+        uint64_t kl = ru64(&r); need(&r, kl); int is_align = kl == 17 && !memcmp(p + r.pos, "general.alignment", 17);
+        r.pos += kl; uint32_t t = ru32(&r);
+        if (is_align && t == 4) { align = ru32(&r); if (!align) align = 32; } else skip_val(&r, t, 0);
+    }
+    TInfo *T = calloc(nt + 1, sizeof *T); if (!T) die("out of memory");
+    for (uint64_t i = 0; i < nt; i++) {
+        uint64_t kl = ru64(&r); need(&r, kl); T[i].name = (const char *)p + r.pos; T[i].nl = (uint32_t)kl; r.pos += kl;
+        uint32_t nd = ru32(&r); uint64_t ne = 1, e0 = 1;
+        for (uint32_t k = 0; k < nd; k++) { uint64_t d = ru64(&r); if (!k) e0 = d; if (__builtin_mul_overflow(ne, d, &ne)) die("bad tensor dims"); }
+        T[i].type = ru32(&r); T[i].off = ru64(&r); T[i].ne0 = e0; T[i].ne = ne; T[i].mem = mem;
+    }
+    uint64_t data = (r.pos + align - 1) / align * align;
+    for (uint64_t i = 0; i < nt; i++) T[i].off += voff + data;
+    *cnt = (int)nt; return T;
+}
+static int cmp_tname(const void *a, const void *b) {
+    const TInfo *x = a, *y = b; uint32_t l = x->nl < y->nl ? x->nl : y->nl; int c = memcmp(x->name, y->name, l);
+    return c ? c : x->nl != y->nl ? (x->nl < y->nl ? -1 : 1) : x->mem < y->mem ? -1 : x->mem > y->mem;
+}
+/* pick seeds: per tensor name present in several files, the version that helps the others most is
+   the root; the others (Q4_K, Q5_K, Q6_K, not involved in copies) are coded given it where the sample
+   says it saves enough. Marks their segments M_SEED with the seed rows. Returns the count. */
+static int choose_seeds(Seg *s, int ns, const uint8_t *p, const Mem *M, const int *dupof, uint64_t *bytes_out, int verbose) {
+    TInfo *all = NULL; int na = 0; *bytes_out = 0;
+    for (int k = 0; k < M->nm; k++) {
+        int c; TInfo *T = gguf_tensors(p + M->voff[k], M->size[k], M->voff[k], (uint32_t)k, &c);
+        if (c) { all = realloc(all, (size_t)(na + c) * sizeof *all); if (!all) die("out of memory"); memcpy(all + na, T, (size_t)c * sizeof *T); na += c; }
+        free(T);
+    }
+    if (na < 2) { free(all); return 0; }
+    qsort(all, na, sizeof *all, cmp_tname);
+    /* segments by offset: which segments make a tensor, and whether any is a copy or has copies */
+    char *indup = calloc(ns + 1, 1); for (int i = 0; i < ns; i++) if (dupof[i] >= 0) { indup[i] = 1; indup[dupof[i]] = 1; }
+    int nseeded = 0;
+    for (int a = 0; a < na;) {
+        int b = a + 1; while (b < na && all[b].nl == all[a].nl && !memcmp(all[b].name, all[a].name, all[a].nl)) b++;
+        int nv = b - a;
+        if (nv >= 2 && nv <= 16) {
+            TInfo *V = all + a; int gain[16][16] = {{0}}, plv[16][16] = {{0}}, sdv[16][16] = {{0}}, ok[16];
+            for (int v = 0; v < nv; v++) {                  /* usable: in range, a whole number of blocks */
+                uint64_t bb = dq_bytes(V[v].type), vp = dq_vpb(V[v].type), mb = V[v].mem;
+                ok[v] = bb && V[v].ne0 && V[v].ne % vp == 0 && V[v].ne0 % vp == 0 && V[v].ne / vp * bb <= M->voff[mb] + M->size[mb] - V[v].off &&
+                        V[v].off >= M->voff[mb] && V[v].ne == V[0].ne && V[v].ne0 == V[0].ne0;
+            }
+            /* targets: their segments exactly the tensor, none a copy or copied (copies are stored once already) */
+            int seg0[16], seg1[16], tgt[16];
+            for (int t = 0; t < nv; t++) {
+                tgt[t] = 0; if (!ok[t] || !seed_can_target(V[t].type)) continue;
+                uint64_t tb = V[t].ne / 256 * (uint64_t)dq_bytes(V[t].type), covered = 0;
+                int lo = 0, hi = ns; while (lo < hi) { int m = (lo + hi) / 2; if (s[m].off < V[t].off) lo = m + 1; else hi = m; }
+                int last = lo, clean = lo < ns && s[lo].off == V[t].off;
+                while (last < ns && s[last].off < V[t].off + tb) { if (indup[last] || s[last].type != V[t].type || (s[last].model & 255) != M_NORMAL) clean = 0; covered += s[last].size; last++; }
+                seg0[t] = lo; seg1[t] = last; tgt[t] = clean && covered == tb && last > lo;
+            }
+            for (int t = 0; t < nv; t++) if (tgt[t]) for (int r = 0; r < nv; r++) if (r != t && ok[r]) {
+                int pl, sd; seed_estimate(V[t].type, p + V[t].off, V[t].ne / 256, V[r].type, p + V[r].off, &pl, &sd);
+                gain[t][r] = pl - sd - SEED_MIN_GAIN_MILLI; plv[t][r] = pl; sdv[t][r] = sd;
+            }
+            int best = -1; long bestg = 0;
+            for (int r = 0; r < nv; r++) if (ok[r]) { long g = 0; for (int t = 0; t < nv; t++) if (t != r && gain[t][r] > 0) g += gain[t][r]; if (g > bestg) { bestg = g; best = r; } }
+            if (best >= 0) for (int t = 0; t < nv; t++) if (t != best && gain[t][best] > 0) {
+                uint64_t bs = (uint64_t)dq_bytes(V[t].type), sb = (uint64_t)dq_bytes(V[best].type), sv = dq_vpb(V[best].type);
+                for (int i = seg0[t]; i < seg1[t]; i++) {
+                    uint64_t e0 = (s[i].off - V[t].off) / bs * 256;
+                    s[i].model = M_SEED; s[i].stype = V[best].type; s[i].soff = V[best].off + e0 / sv * sb;
+                    *bytes_out += s[i].size;
+                }
+                nseeded++;
+                if (verbose) printf("  seed: %.*s in %s given %s: values %.2f -> %.2f b/w (sample, no context)\n", (int)V[t].nl, V[t].name,
+                                    M->name[V[t].mem], M->name[V[best].mem], plv[t][best] / 1000.0, sdv[t][best] / 1000.0);
+            }
+        }
+        a = b;
+    }
+    free(indup); free(all);
+    return nseeded;
+}
+static void cmd_compress(const char **paths, int npaths, int isdir, const char *out, int threads, uint64_t segb, int test, uint64_t limit, int hsym, int quick) {
+    Mem M = {npaths, isdir, paths, NULL, NULL, NULL}; uint64_t n; const uint8_t *p = map_members(&M, &n);
+    uint64_t data = 0; for (int k = 0; k < M.nm; k++) data += M.size[k];
+    /* -s not given: segments of 1/24 of the input, from 8 to 48 MiB (48 from about 1.1 GB on), so a small file has enough of them to keep
+       every thread busy to the end; by input size only, so an input splits the same way everywhere (in a folder: the same size
+       for every file, so the same tensors in two files make the same segments) */
+    if (!segb) { segb = data / 24 >> 20 << 20; if (segb < (8u << 20)) segb = 8u << 20; if (segb > (48u << 20)) segb = 48u << 20; }
+    Seg *s = NULL; int ns = 0; uint64_t unm[NGGML + 1] = {0};
+    for (int k = 0; k < M.nm; k++) {
+        int nk; Seg *sk = find_segments(p + M.voff[k], M.size[k], segb, &nk);
+        for (int t = 0; t <= NGGML; t++) unm[t] += g_unmodelled[t];
+        s = realloc(s, (size_t)(ns + nk + 1) * sizeof *s); if (!s) die("out of memory");
+        for (int i = 0; i < nk; i++) { sk[i].off += M.voff[k]; s[ns++] = sk[i]; }
+        free(sk);
+        if (M.dir) printf("  %s: %.1f MiB, %d segments\n", M.name[k], M.size[k] / 1048576.0, nk);
+    }
+    if (M.dir) printf("%d files, %.1f MiB, %d segments to code\n", M.nm, data / 1048576.0, ns);
+    else printf("%s: %.1f MiB, %d segments to code\n", M.path[0], data / 1048576.0, ns);
+    for (int t = 0; t <= NGGML; t++) if (unm[t])
+        printf("note: %.*f MiB of %s tensors, a type tenz has no model for: stored as they are\n", MiB(unm[t]) < 0.1 ? 3 : 1, MiB(unm[t]), ggml_name(t));
+    int *dupof = xmalloc((size_t)(ns + 1) * sizeof *dupof); uint64_t dupb; int nd = find_dups(s, ns, p, dupof, &dupb);
+    if (nd) printf("identical segments: %d, %.1f MiB, stored once\n", nd, dupb / 1048576.0);
+    uint64_t seedb = 0; int nseed = M.nm > 1 ? choose_seeds(s, ns, p, &M, dupof, &seedb, getenv("TENZ_SEEDLOG") != NULL) : 0;
+    if (nseed) printf("seeded tensors: %d, %.1f MiB, coded given the same tensor in another file\n", nseed, seedb / 1048576.0);
+    int nsl = 0; for (int i = 0; i < ns; i++) nsl += (s[i].model & 255) == M_SEED;
     Job j; memset(&j, 0, sizeof j);
     j.mode = test ? 2 : 0; j.seg = s; j.n = ns; j.in = p; j.fd = -1; j.phase = 1; j.quick = quick;
     if (quick) printf("quick (-q): Q4_K, Q5_K, Q4_0, Q8_0, floats and metadata strings in faster models, at a small cost in size\n");
@@ -3405,19 +3801,13 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
     j.ownf = calloc(ns + 1, sizeof *j.ownf); j.ownN = calloc(ns + 1, sizeof *j.ownN); j.held = calloc(ns + 1, 8);
     j.skip = calloc(ns + 1, 1);
     if (!j.clen || !j.coff || !j.ownf || !j.ownN || !j.held || !j.skip) die("out of memory");
-    uint64_t seg_total = 0; for (int i = 0; i < ns; i++) seg_total += s[i].size;
-    uint64_t hdr = HDR + (uint64_t)ns * ENTRY;
-    if (!test) {
-        j.fd = open(out, O_RDWR | O_CREAT | O_TRUNC, 0644); if (j.fd < 0) die("cannot create output");
-        uint64_t at = 0, w = hdr;
-        for (int i = 0; i <= ns; i++) {
-            uint64_t end = i < ns ? s[i].off : n;
-            pwrite_all(j.fd, p + at, end - at, w); w += end - at;
-            if (i < ns) at = s[i].off + s[i].size;
-        }
-        j.end = w;
-    }
-    for (int i = 0; i < ns; i++) j.skip[i] = kq_index(s[i].type) < 0;   /* metadata waits for pass 2 */
+    uint64_t hdr = HDR + (uint64_t)ns * ENTRY + 4 + (uint64_t)nsl * 16;
+    for (int k = 0; k < M.nm; k++) { size_t l = strlen(M.name[k]); if (l > 65535) die("file name too long"); hdr += 18 + l; }
+    if (!test) { j.fd = open(out, O_RDWR | O_CREAT | O_TRUNC, 0644); if (j.fd < 0) die("cannot create output"); }
+    GapW gw = {test ? -1 : j.fd, p, hdr, 0};
+    for_gaps(s, ns, M.nm, M.voff, M.size, gap_write, &gw);
+    j.end = gw.w;
+    for (int i = 0; i < ns; i++) j.skip[i] = kq_index(s[i].type) < 0 || dupof[i] >= 0;   /* metadata waits for pass 2 */
     double t0 = now(); run(&j, threads);                 /* pass 1: counts (Q6_K: lattice or not) */
     /* seeds: one table set per type, from the counts of all its static segments */
     size_t seed_cap = 4096;
@@ -3447,32 +3837,51 @@ static void cmd_compress(const char *in, const char *out, int threads, uint64_t 
     free(sc.buf);
     /* pass 2: static segments and metadata */
     j.phase = 2;
-    for (int i = 0; i < ns; i++) { j.skip[i] = kq_index(s[i].type) >= 0 && j.ownf[i] == NULL; j.need[i] = seg_need(&s[i], j.mode, 2); }
+    for (int i = 0; i < ns; i++) { j.skip[i] = (kq_index(s[i].type) >= 0 && j.ownf[i] == NULL) || dupof[i] >= 0; j.need[i] = seg_need(&s[i], j.mode, 2); }
     run(&j, threads);
     double t1 = now();
     for (int t = 0; t < NSTATIC; t++) { seed_free(&j.seed[t]); seed_free(&j.dseed[t]); }
     uint64_t ctotal = seed_len; for (int i = 0; i < ns; i++) ctotal += j.clen[i];
-    uint64_t out_total = hdr + (n - seg_total) + ctotal;
+    uint64_t out_total = hdr + gw.sum + ctotal;
     if (test) printf("compressed and decompressed in %.1f s\n", t1 - t0);
     else printf("compressed in %.1f s (%.1f MiB/s)\n", t1 - t0, n / 1048576.0 / (t1 - t0));
-    report(s, ns, j.clen, n, out_total);
+    report(s, ns, j.clen, data, out_total);
     time_report(&j, t1 - t0, threads);
     if (test) {
         printf("round trip: %s\n", j.failed ? "FAILED, data differs" : "OK, identical");
         if (j.failed) exit(2);
         return;
     }
-    uint8_t *h = calloc(1, hdr); uint64_t v = n; uint32_t c32 = (uint32_t)ns;
+    uint8_t *h = calloc(1, hdr); uint64_t v = n; uint32_t c32 = (uint32_t)ns, nm32 = (uint32_t)M.nm, fl = M.dir ? 1 : 0;
     memcpy(h, MAGIC, 8); memcpy(h + 8, &v, 8); memcpy(h + 16, &c32, 4); memcpy(h + 20, &seed_off, 8); memcpy(h + 28, &seed_len, 8);
-    for (int i = 0; i < ns; i++) {
-        uint8_t *e = h + HDR + (uint64_t)i * ENTRY; uint32_t tm = s[i].type | (s[i].model << 16);
-        memcpy(e, &s[i].off, 8); memcpy(e + 8, &s[i].ne0, 8); memcpy(e + 16, &s[i].rows, 8);
-        memcpy(e + 24, &tm, 4); memcpy(e + 28, &j.clen[i], 8); memcpy(e + 36, &j.coff[i], 8);
+    memcpy(h + 36, &nm32, 4); memcpy(h + 40, &fl, 4);
+    uint8_t *e = h + HDR;
+    for (int k = 0; k < M.nm; k++) {
+        uint16_t l = (uint16_t)strlen(M.name[k]);
+        memcpy(e, &M.voff[k], 8); memcpy(e + 8, &M.size[k], 8); memcpy(e + 16, &l, 2); memcpy(e + 18, M.name[k], l); e += 18 + l;
     }
+    for (int i = 0; i < ns; i++, e += ENTRY) {
+        uint32_t tm = s[i].type | (s[i].model << 16); uint64_t cl = dupof[i] >= 0 ? 0 : j.clen[i], co = dupof[i] >= 0 ? (uint64_t)dupof[i] : j.coff[i];
+        memcpy(e, &s[i].off, 8); memcpy(e + 8, &s[i].ne0, 8); memcpy(e + 16, &s[i].rows, 8);
+        memcpy(e + 24, &tm, 4); memcpy(e + 28, &cl, 8); memcpy(e + 36, &co, 8);
+    }
+    /* the seeds: per segment chosen for one (it may since have been stored raw), its seed's type and rows */
+    uint32_t n32 = 0; uint8_t *e0 = e; e += 4;
+    for (int i = 0; i < ns; i++) if (s[i].stype || s[i].soff) {
+        uint32_t i32 = (uint32_t)i; memcpy(e, &i32, 4); memcpy(e + 4, &s[i].stype, 4); memcpy(e + 8, &s[i].soff, 8); e += 16; n32++;
+    }
+    if ((int)n32 != nsl) die("internal: seed list");
+    memcpy(e0, &n32, 4);
     pwrite_all(j.fd, h, hdr, 0); close(j.fd); free(h);
 }
 
-static void cmd_decompress(const char *in, const char *out, int threads, uint64_t limit) {
+typedef struct { Job *j; const uint8_t *p; uint64_t pos, n; } GapR;
+static void check_output(const char *in, const char *out, int force);
+static void gap_copy(void *c, uint64_t a, uint64_t b) {
+    GapR *g = c; if (b - a > g->n - g->pos) die("corrupt file");
+    mem_write(g->j, g->p + g->pos, b - a, a); g->pos += b - a;
+}
+static void cmd_decompress(const char *in, const char *out, int threads, uint64_t limit, int force) {
     size_t n; const uint8_t *p = map_file(in, &n);
     if (n < HDR) die("not a tenz file");
     if (memcmp(p, MAGIC, 8)) {
@@ -3488,41 +3897,97 @@ static void cmd_decompress(const char *in, const char *out, int threads, uint64_
         }
         die("not a tenz file");
     }
-    uint64_t orig; uint32_t ns; memcpy(&orig, p + 8, 8); memcpy(&ns, p + 16, 4);
+    uint64_t orig; uint32_t ns, nm, flags; memcpy(&orig, p + 8, 8); memcpy(&ns, p + 16, 4);
     uint64_t seed_off, seed_len; memcpy(&seed_off, p + 20, 8); memcpy(&seed_len, p + 28, 8);
-    if (seed_off > n || seed_len > n - seed_off) die("corrupt header");
-    uint64_t pos = HDR; if ((uint64_t)ns * ENTRY > n - pos) die("corrupt header");
+    memcpy(&nm, p + 36, 4); memcpy(&flags, p + 40, 4);
+    if (seed_off > n || seed_len > n - seed_off || !nm || nm > (n - HDR) / 18 || flags > 1) die("corrupt header");
+    uint64_t pos = HDR, *mvoff = calloc(nm, 8), *msize = calloc(nm, 8); char **mname = calloc(nm, sizeof *mname);
+    for (uint32_t k = 0; k < nm; k++) {
+        if (n - pos < 18) die("corrupt header");
+        uint16_t l; memcpy(&mvoff[k], p + pos, 8); memcpy(&msize[k], p + pos + 8, 8); memcpy(&l, p + pos + 16, 2); pos += 18;
+        if (n - pos < l || !l) die("corrupt header");
+        mname[k] = xmalloc(l + 1); memcpy(mname[k], p + pos, l); mname[k][l] = 0; pos += l;
+        /* a plain file name: no folders, nothing hidden that could point elsewhere */
+        if (strchr(mname[k], '/') || strchr(mname[k], '\\') || !strcmp(mname[k], ".") || !strcmp(mname[k], "..") || strlen(mname[k]) != l) die("corrupt header");
+        if ((k && mvoff[k] < mvoff[k - 1] + msize[k - 1]) || msize[k] > orig || mvoff[k] > orig - msize[k]) die("corrupt header");
+    }
+    if ((uint64_t)ns * ENTRY > n - pos) die("corrupt header");
     Seg *s = calloc(ns + 1, sizeof *s); uint64_t *clen = calloc(ns + 1, 8), *coff = calloc(ns + 1, 8);
+    int *dupf = xmalloc((ns + 1) * sizeof(int)), *dupn = xmalloc((ns + 1) * sizeof(int)); char *skip = calloc(ns + 1, 1);
     for (uint32_t i = 0; i < ns; i++) {
         const uint8_t *e = p + pos; uint32_t tm;
         memcpy(&s[i].off, e, 8); memcpy(&s[i].ne0, e + 8, 8); memcpy(&s[i].rows, e + 16, 8);
         memcpy(&tm, e + 24, 4); memcpy(&clen[i], e + 28, 8); memcpy(&coff[i], e + 36, 8);
-        s[i].type = tm & 0xFFFF; s[i].model = tm >> 16;
+        s[i].type = tm & 0xFFFF; s[i].model = tm >> 16; dupf[i] = dupn[i] = -1;
         if (type_index(s[i].type) < 0 || !s[i].ne0) die("corrupt header");
         {   uint32_t md = s[i].model & 255;
-            if (md != M_NORMAL && md != M_RAW && !(md == M_LATTICE && s[i].type == T_Q6K) &&
+            if (md != M_NORMAL && md != M_RAW && md != M_DUP && !(md == M_SEED && seed_can_target(s[i].type)) && !(md == M_LATTICE && s[i].type == T_Q6K) &&
                 !(md == M_QUICK && has_quick(s[i].type)) && !(md == M_GPU && s[i].type == T_Q4K)) die("corrupt header");
             if (s[i].model >> 8) die("corrupt header"); }
         s[i].size = seg_bytes(&s[i]); pos += ENTRY;
-        if (coff[i] > n || clen[i] > n - coff[i] || s[i].off > orig || s[i].size > orig - s[i].off) die("corrupt header");
+        if (s[i].off > orig || s[i].size > orig - s[i].off || (i && s[i].off < s[i - 1].off + s[i - 1].size)) die("corrupt header");
+        if (s[i].model == M_DUP) {                       /* a copy of an earlier segment, written with it */
+            uint64_t r = coff[i];
+            if (clen[i] || r >= i || s[r].model == M_DUP || s[r].type != s[i].type || s[r].size != s[i].size) die("corrupt header");
+            dupn[i] = dupf[r]; dupf[r] = (int)i; skip[i] = 1;
+        } else if (coff[i] > n || clen[i] > n - coff[i]) die("corrupt header");
     }
-    int fd = open(out, O_RDWR | O_CREAT | O_TRUNC, 0644); if (fd < 0) die("cannot create output");
-    uint64_t at = 0;
-    for (uint32_t i = 0; i <= ns; i++) {
-        uint64_t end = i < ns ? s[i].off : orig;
-        if (end < at || end - at > n - pos) die("corrupt file");
-        pwrite_all(fd, p + pos, end - at, at); pos += end - at;
-        if (i < ns) at = s[i].off + s[i].size;
+    /* the seeds: rows of another member, of a type tenz dequantizes, that no seeded segment overlaps */
+    if (n - pos < 4) die("corrupt header");
+    uint32_t nsl; memcpy(&nsl, p + pos, 4); pos += 4;
+    if (nsl > ns || (uint64_t)nsl * 16 > n - pos) die("corrupt header");
+    for (uint32_t q = 0; q < nsl; q++) {
+        uint32_t i, st; uint64_t so; memcpy(&i, p + pos, 4); memcpy(&st, p + pos + 4, 4); memcpy(&so, p + pos + 8, 8); pos += 16;
+        if (i >= ns || (!st && !so) || s[i].stype || s[i].soff || !dq_bytes(st) || !seed_can_target(s[i].type)) die("corrupt header");
+        s[i].stype = st; s[i].soff = so;
+        uint64_t sb = seed_bytes(&s[i]); int k = 0; while (k + 1 < (int)nm && mvoff[k + 1] <= so) k++;
+        if (so < mvoff[k] || sb > msize[k] || so - mvoff[k] > msize[k] - sb || s[i].size % (tgt_bs(s[i].type))) die("corrupt header");
+    }
+    for (uint32_t i = 0; i < ns; i++) if ((s[i].model & 255) == M_SEED) {
+        if (!s[i].stype && !s[i].soff) die("corrupt header");
+        for (uint32_t q = 0; q < ns; q++) if ((s[q].model & 255) == M_SEED || (s[q].model == M_DUP && (s[coff[q]].model & 255) == M_SEED)) {
+            /* a seed must not need anything decoded in the second round */
+            uint64_t a = s[i].soff, b = a + seed_bytes(&s[i]);
+            if (s[q].off < b && a < s[q].off + s[q].size) die("corrupt header");
+        }
+    }
+    int *mfd = calloc(nm, sizeof *mfd);
+    if (flags & 1) {
+        struct stat st;
+        if (mkdir(out, 0755) && !(errno == EEXIST && !stat(out, &st) && S_ISDIR(st.st_mode))) { fprintf(stderr, "tenz: cannot make folder %s\n", out); exit(1); }
+        for (uint32_t k = 0; k < nm; k++) {
+            size_t L = strlen(out) + strlen(mname[k]) + 2; char *path = xmalloc(L); snprintf(path, L, "%s/%s", out, mname[k]);
+            check_output(in, path, force);
+            mfd[k] = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644); if (mfd[k] < 0) { fprintf(stderr, "tenz: cannot create %s\n", path); exit(1); }
+            free(path);
+        }
+        printf("%s: %u files\n", out, nm);
+    } else {
+        if (nm != 1 || mvoff[0]) die("corrupt header");
+        check_output(in, out, force);
+        mfd[0] = open(out, O_RDWR | O_CREAT | O_TRUNC, 0644); if (mfd[0] < 0) die("cannot create output");
     }
     Job j; memset(&j, 0, sizeof j);
-    j.mode = 1; j.seg = s; j.n = (int)ns; j.in = p; j.fd = fd; j.clen = clen; j.coff = coff;
+    j.mode = 1; j.seg = s; j.n = (int)ns; j.in = p; j.fd = -1; j.clen = clen; j.coff = coff; j.skip = skip;
+    j.nm = (int)nm; j.mfd = mfd; j.mvoff = mvoff; j.msize = msize; j.dupf = dupf; j.dupn = dupn;
+    GapR gr = {&j, p, pos, n};
+    for_gaps(s, (int)ns, (int)nm, mvoff, msize, gap_copy, &gr);
     { Coder d; dec_init(&d, p + seed_off, seed_len); code_seeds(&d, 1, j.dseed); }
     threads = plan_memory(&j, threads, limit);
-    double t0 = now(); run(&j, threads); double t1 = now();
-    if (ftruncate(fd, (off_t)orig)) die("cannot size output");
-    close(fd);
+    /* round 1: everything but the seeded segments; round 2: those, reading their seeds back */
+    int any2 = 0; for (uint32_t i = 0; i < ns; i++) if ((s[i].model & 255) == M_SEED) { skip[i] = 1; any2 = 1; }
+    double t0 = now(); run(&j, threads);
+    if (any2) {
+        for (uint32_t i = 0; i < ns; i++) skip[i] = (s[i].model & 255) != M_SEED;
+        run(&j, threads);
+    }
+    double t1 = now();
+    uint64_t data = 0;
+    for (uint32_t k = 0; k < nm; k++) { if (ftruncate(mfd[k], (off_t)msize[k])) die("cannot size output"); close(mfd[k]); data += msize[k]; }
     for (int t = 0; t < NSTATIC; t++) seed_free(&j.dseed[t]);
-    printf("decompressed %.1f MiB in %.1f s (%.1f MiB/s)\n", orig / 1048576.0, t1 - t0, orig / 1048576.0 / (t1 - t0));
+    printf("decompressed %.1f MiB in %.1f s (%.1f MiB/s), from %.1f MiB (%.2f%% saved)\n", data / 1048576.0, t1 - t0, data / 1048576.0 / (t1 - t0),
+           n / 1048576.0, data ? 100.0 * (1.0 - (double)n / (double)data) : 0);
+    if (any2) printf("  seeds: %.1f thread-seconds reading seed rows, %.1f turning ranks back into values (in the times below)\n", g_seed_read, g_seed_xf);
     time_report(&j, t1 - t0, threads);
 }
 
@@ -3561,15 +4026,17 @@ int main(int argc, char **argv) {
     }
     if (argc < 3) {
         fprintf(stderr,
-            "usage: tenz c in [out.tenz] [-t threads]"
+            "usage: tenz c in|folder [out.tenz] [-t threads]"
             " [-s segment_MiB] [-m MiB] [-q] [-g] [-f]\n"
             "       tenz d in.tenz [out] [-t threads]"
             " [-m MiB] [-f]\n"
-            "       tenz t in [-t threads] [-s segment_MiB]"
+            "       tenz t in|folder [-t threads] [-s segment_MiB]"
             " [-m MiB] [-q] [-g]   (round-trip test, no files)\n"
             "       tenz v   (version)\n"
             "  out defaults to in + .tenz (c) or in without"
             " .tenz (d); -f overwrites an existing file\n"
+            "  folder: its .gguf and .safetensors files in one archive (d makes the folder again);\n"
+            "  identical tensors are stored once\n"
             "  -q: quick, Q4_K, Q5_K, Q4_0, Q8_0, floats, strings"
             " in faster models (a little larger)\n"
             "  -g: experimental, Q4_K decodable on a GPU (OpenCL)\n"
@@ -3620,20 +4087,38 @@ int main(int argc, char **argv) {
     segb <<= 20;
     char cmd = argv[1][0];
     int one = argv[1][1] == 0;
+    /* a folder as input (c, t): its .gguf and .safetensors files, by name, in one archive */
+    char *in0 = strdup(pos[0]); { size_t l = strlen(in0); while (l > 1 && in0[l - 1] == '/') in0[--l] = 0; }
+    const char **files = NULL; int nfiles = 1, isdir = 0; struct stat ist;
+    if ((cmd == 'c' || cmd == 't') && !stat(in0, &ist) && S_ISDIR(ist.st_mode)) {
+        DIR *dp = opendir(in0); if (!dp) die("cannot read the folder");
+        struct dirent *de; nfiles = 0; isdir = 1; char **names = NULL;
+        while ((de = readdir(dp))) {
+            size_t l = strlen(de->d_name);
+            int ok = (l > 5 && !strcmp(de->d_name + l - 5, ".gguf")) || (l > 12 && !strcmp(de->d_name + l - 12, ".safetensors"));
+            if (!ok || de->d_name[0] == '.') continue;
+            size_t L = strlen(in0) + l + 2; char *pth = xmalloc(L); snprintf(pth, L, "%s/%s", in0, de->d_name);
+            struct stat fs; if (stat(pth, &fs) || !S_ISREG(fs.st_mode) || !fs.st_size) { free(pth); continue; }
+            names = realloc(names, (nfiles + 1) * sizeof *names); names[nfiles++] = pth;
+        }
+        closedir(dp);
+        if (!nfiles) die("no .gguf or .safetensors files in the folder");
+        for (int a = 1; a < nfiles; a++) for (int b = a; b > 0 && strcmp(names[b - 1], names[b]) > 0; b--) { char *t = names[b]; names[b] = names[b - 1]; names[b - 1] = t; }
+        files = (const char **)names;
+    } else { files = malloc(sizeof *files); files[0] = in0; }
     if ((cmd == 'c' || cmd == 'd') && one) {
-        char *out = out_name(pos[0], pos[1], cmd == 'd');
-        check_output(pos[0], out, force);
-        if (cmd == 'c')
-            cmd_compress(pos[0], out, threads, segb, 0,
-                         limit, hsym, quick);
-        else
+        char *out = out_name(in0, pos[1], cmd == 'd');
+        if (cmd == 'c') {
+            check_output(in0, out, force);
+            if (isdir) { size_t lo = strlen(out); for (int k = 0; k < nfiles; k++) if (!strncmp(files[k], out, lo) && files[k][lo] == 0) die("output is one of the inputs"); }
+            cmd_compress(files, nfiles, isdir, out, threads, segb, 0, limit, hsym, quick);
+        } else
             { if (quick) printf("-q: only for c and t, the decoder reads it from the file (ignored)\n");
-              cmd_decompress(pos[0], out, threads, limit); }
+              cmd_decompress(in0, out, threads, limit, force); }
         free(out);
     } else if (cmd == 't' && one) {
         if (pos[1]) die("t takes no output name");
-        cmd_compress(pos[0], NULL, threads, segb, 1,
-                     limit, hsym, quick);
+        cmd_compress(files, nfiles, isdir, NULL, threads, segb, 1, limit, hsym, quick);
     } else {
         die("unknown command (use c, d, t or v)");
     }

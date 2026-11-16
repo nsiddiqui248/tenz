@@ -1,10 +1,15 @@
 # Changelog
 
-The version and the file format share one number: tenz 0.25 writes and reads format 25 (magic `TENZ25`). Until 1.0, a `.tenz` file only decompresses with the version that made it. Versions up to 0.15 were released as foldz; a `.foldz` file needs the foldz version that made it.
+The version and the file format share one number: tenz 0.26 writes and reads format 26 (magic `TENZ26`). Until 1.0, a `.tenz` file only decompresses with the version that made it. Versions up to 0.15 were released as foldz; a `.foldz` file needs the foldz version that made it.
 
 Each section becomes the release notes when its tag (for example `v0.23`) is pushed; see `.github/workflows/release.yml`.
 
 ## [Unreleased]
+
+## [0.26] - 2026-11-16
+- Folders: `tenz c folder/` puts its model files in one archive; identical tensors across files are stored once, tables are shared. `tenz d` makes the folder again.
+- Seeds: in a folder, Q3_K, Q4_K, Q5_K and Q6_K tensors are coded given the same tensor in another file where a sample shows it helps. Qwen3-4B Q3_K_M + Q4_K_M: 2962 MiB instead of about 3920 as two files.
+- Fix: 0.25 files carried the magic of format 24.
 
 ## [0.25] - 2026-11-15
 - Experimental `-g`: Q4_K coded so that a GPU can decode it (OpenCL, loaded at run time); on an Adreno 725 about as fast as the CPU with `-q`, so meant for faster GPUs. Without `-g`, everything is coded as in 0.24.

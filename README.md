@@ -4,7 +4,7 @@
 
 tenz parses the GGUF file, unpacks each tensor's blocks into the real quantized values and their scales, and codes them with context models fitted to the data itself, using rANS and a range coder. Quantized values are coded as whole symbols (Q8_0 and floats as 4-bit symbols) from static tables: the compressor counts the whole file first and stores one shared seed table per type, and each segment stores only how its tables differ from the seed. Decompression therefore learns nothing. Metadata and padding are coded with a byte-level context-mixing model; tensors of types tenz has no model for are stored as they are. Nothing depends on the model's name or architecture. Safetensors files (F32, F16, BF16 tensors) are parsed the same way.
 
-> Status: **0.25, pre-release** (file format 25). The file format may change before 1.0; a `.tenz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)). Changes per version: [CHANGELOG.md](CHANGELOG.md).
+> Status: **0.26, pre-release** (file format 26). The file format may change before 1.0; a `.tenz` file is only guaranteed to decompress with the version that made it. Testing and review are very welcome (see [Help wanted](#help-wanted)). Changes per version: [CHANGELOG.md](CHANGELOG.md).
 
 ## Results
 
@@ -149,6 +149,8 @@ tenz c model.gguf          # writes model.gguf.tenz
 tenz d model.gguf.tenz     # writes model.gguf
 tenz c in.gguf out.tenz    # explicit output name
 tenz t model.gguf          # round-trip test in memory, writes nothing
+tenz c models/             # a folder: its .gguf and .safetensors files in one archive, models.tenz
+tenz d models.tenz out/    # makes the folder again (default: models)
 tenz v                     # version
 ```
 
@@ -164,6 +166,8 @@ Options can go anywhere on the line:
 | `-f` | overwrite an existing output file |
 
 tenz never overwrites a file unless `-f` is given, and never writes over its own input.
+
+**Folders.** `tenz c folder/` puts the folder's `.gguf` and `.safetensors` files (not subfolders) in one archive, coded together: tensors that are identical in two files (for example the Q6_K tensors that a model's Q3_K_M and Q4_K_M files share) are stored once, and every type's tables are learned once for all files. Q3_K, Q4_K, Q5_K and Q6_K tensors that another file has too (a fine-tune and its base, two quantizations of one model) are coded given it: the other file's weights, put on this block's scale, predict each value, and the value is coded as its distance from the prediction. tenz picks the seed per tensor from a sample of its blocks, and only where it helps; unrelated files are coded as on their own. Qwen3-4B Q3_K_M and Q4_K_M in one folder: 4361.1 → 2962.0 MiB (32.1% saved; about 3920 MiB as two separate files), compressed in 88 s and decompressed in 34 s on 3 threads (23 s without seeds). Synthetic fine-tune with its base: the fine-tune costs 58–81% less (weights changed by 10% to 1%). `tenz d` makes the folder again with the same file names; it decodes the seeds first.
 
 **Memory.** By default tenz uses what is free at start, minus a reserve for the device: 15% of RAM, at least 512 MiB and at most 2 GiB. Segments run in parallel only as far as that budget allows; one segment can always run, so tenz never stalls. With `-m` you set the limit yourself, and the free-memory checks are off. At start tenz prints the budget, and at the end the peak it used. Free memory is read from `/proc/meminfo` on Linux and Android, from the kernel on macOS and FreeBSD, and a cgroup v2 limit counts too (containers).
 
