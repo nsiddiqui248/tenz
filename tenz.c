@@ -66,6 +66,7 @@
  * Usage:  tenz c model.gguf model.tenz [-t threads] [-s segment_MiB] [-m MiB] [-q]
  *         tenz d model.tenz model.gguf [-t threads] [-m MiB]
  *         tenz t model.gguf [-t threads] [-s segment_MiB] [-m MiB] [-q]   (round trip in memory)
+ *         tenz l in.tenz   (lists the files in an archive, from its header)
  *         -g (c, t; experimental): Q4_K coded so a GPU can decode it (OpenCL, loaded at run time when
  *         decompressing; the CPU if none, or as well). TENZ_GPU=0: CPU only, 2: GPU only; TENZ_GPU_CHECK=1:
  *         compare every GPU segment with the CPU (the first one always is)
@@ -3991,6 +3992,57 @@ static void cmd_decompress(const char *in, const char *out, int threads, uint64_
     time_report(&j, t1 - t0, threads);
 }
 
+/* l: the files in an archive, from its header alone (nothing is decoded) */
+typedef struct { const uint64_t *voff; uint32_t nm; uint64_t *stored; } GapL;
+static uint32_t member_of(const uint64_t *voff, uint32_t nm, uint64_t off) {
+    uint32_t lo = 0, hi = nm - 1; while (lo < hi) { uint32_t m = (lo + hi + 1) / 2; if (voff[m] <= off) lo = m; else hi = m - 1; } return lo;
+}
+static void gap_list(void *c, uint64_t a, uint64_t b) { GapL *g = c; if (b > a) g->stored[member_of(g->voff, g->nm, a)] += b - a; }
+static void cmd_list(const char *in) {
+    size_t n; const uint8_t *p = map_file(in, &n);
+    if (n < HDR || memcmp(p, MAGIC, 8)) {
+        if (n >= 8 && !memcmp(p, "TENZ", 4) && p[6] == '\n')
+            fprintf(stderr, "tenz: file format %d, but tenz " TENZ_VERSION " reads only format " TENZ_FORMAT "\n", atoi((const char *)p + 4)), exit(1);
+        die("not a tenz file");
+    }
+    uint64_t orig, seed_off, seed_len; uint32_t ns, nm, flags;
+    memcpy(&orig, p + 8, 8); memcpy(&ns, p + 16, 4); memcpy(&seed_off, p + 20, 8); memcpy(&seed_len, p + 28, 8); memcpy(&nm, p + 36, 4); memcpy(&flags, p + 40, 4);
+    if (!nm || nm > (n - HDR) / 18 || flags > 1) die("corrupt header");
+    uint64_t pos = HDR, *voff = calloc(nm, 8), *size = calloc(nm, 8), *stored = calloc(nm, 8); char **name = calloc(nm, sizeof *name);
+    uint32_t *nseg = calloc(nm, 4), *nseed = calloc(nm, 4), *ndup = calloc(nm, 4), *nraw = calloc(nm, 4);
+    for (uint32_t k = 0; k < nm; k++) {
+        if (n - pos < 18) die("corrupt header");
+        uint16_t l; memcpy(&voff[k], p + pos, 8); memcpy(&size[k], p + pos + 8, 8); memcpy(&l, p + pos + 16, 2); pos += 18;
+        if (n - pos < l || !l) die("corrupt header");
+        name[k] = xmalloc(l + 1); memcpy(name[k], p + pos, l); name[k][l] = 0; pos += l;
+        if ((k && voff[k] < voff[k - 1] + size[k - 1]) || size[k] > orig || voff[k] > orig - size[k]) die("corrupt header");
+    }
+    if ((uint64_t)ns * ENTRY > n - pos) die("corrupt header");
+    Seg *s = calloc(ns + 1, sizeof *s);
+    for (uint32_t i = 0; i < ns; i++, pos += ENTRY) {
+        const uint8_t *e = p + pos; uint32_t tm; uint64_t clen;
+        memcpy(&s[i].off, e, 8); memcpy(&s[i].ne0, e + 8, 8); memcpy(&s[i].rows, e + 16, 8); memcpy(&tm, e + 24, 4); memcpy(&clen, e + 28, 8);
+        s[i].type = tm & 0xFFFF; s[i].model = tm >> 16;
+        if (type_index(s[i].type) < 0 || !s[i].ne0) die("corrupt header");
+        s[i].size = seg_bytes(&s[i]);
+        if (s[i].off > orig || s[i].size > orig - s[i].off || (i && s[i].off < s[i - 1].off + s[i - 1].size) || clen > n) die("corrupt header");
+        uint32_t k = member_of(voff, nm, s[i].off), md = s[i].model & 255;
+        if (s[i].off < voff[k] || s[i].off + s[i].size > voff[k] + size[k]) die("corrupt header");
+        nseg[k]++; stored[k] += md == M_DUP ? 0 : clen; nseed[k] += md == M_SEED; ndup[k] += md == M_DUP; nraw[k] += md == M_RAW;
+    }
+    GapL gl = {voff, nm, stored}; for_gaps(s, (int)ns, (int)nm, voff, size, gap_list, &gl);
+    uint64_t data = 0, st = 0; for (uint32_t k = 0; k < nm; k++) { data += size[k]; st += stored[k]; }
+    printf("%s: %u file%s, %.1f MiB stored in %.1f MiB (%.2f%% saved), format " TENZ_FORMAT "%s\n", in, nm, nm == 1 ? "" : "s",
+           data / 1048576.0, n / 1048576.0, data ? 100.0 * (1.0 - (double)n / (double)data) : 0, flags & 1 ? ", a folder" : "");
+    printf("    original       stored   saved  segments  seeded  copies     raw  name\n");
+    for (uint32_t k = 0; k < nm; k++)
+        printf("%9.1f MiB %9.1f MiB %6.2f%% %9u %7u %7u %7u  %s\n", size[k] / 1048576.0, stored[k] / 1048576.0,
+               size[k] ? 100.0 * (1.0 - (double)stored[k] / (double)size[k]) : 0, nseg[k], nseed[k], ndup[k], nraw[k], name[k]);
+    printf("%s: %.1f MiB (the index, %.1f MiB of tables)\n", nm > 1 ? "shared by all" : "index and tables", (n - st) / 1048576.0, seed_len / 1048576.0);
+    if (nm > 1) printf("  stored: each file's coded segments and the bytes between them; copies cost nothing (stored with\n"
+                       "  their first occurrence); seeded segments need their seed, in another file, to be decoded\n");
+}
+
 /* output name: given, or derived from the input (in.gguf -> in.gguf.tenz, in.gguf.tenz -> in.gguf) */
 static char *out_name(const char *in, const char *given, int decompress) {
     if (given) return strdup(given);
@@ -4032,6 +4084,7 @@ int main(int argc, char **argv) {
             " [-m MiB] [-f]\n"
             "       tenz t in|folder [-t threads] [-s segment_MiB]"
             " [-m MiB] [-q] [-g]   (round-trip test, no files)\n"
+            "       tenz l in.tenz   (list the files in it)\n"
             "       tenz v   (version)\n"
             "  out defaults to in + .tenz (c) or in without"
             " .tenz (d); -f overwrites an existing file\n"
@@ -4116,11 +4169,14 @@ int main(int argc, char **argv) {
             { if (quick) printf("-q: only for c and t, the decoder reads it from the file (ignored)\n");
               cmd_decompress(in0, out, threads, limit, force); }
         free(out);
+    } else if (cmd == 'l' && one) {
+        if (pos[1]) die("l takes no output name");
+        cmd_list(in0);
     } else if (cmd == 't' && one) {
         if (pos[1]) die("t takes no output name");
         cmd_compress(files, nfiles, isdir, NULL, threads, segb, 1, limit, hsym, quick);
     } else {
-        die("unknown command (use c, d, t or v)");
+        die("unknown command (use c, d, t, l or v)");
     }
     return 0;
 }

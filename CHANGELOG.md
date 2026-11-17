@@ -9,6 +9,7 @@ Each section becomes the release notes when its tag (for example `v0.23`) is pus
 ## [0.26] - 2026-11-16
 - Folders: `tenz c folder/` puts its model files in one archive; identical tensors across files are stored once, tables are shared. `tenz d` makes the folder again.
 - Seeds: in a folder, Q3_K, Q4_K, Q5_K and Q6_K tensors are coded given the same tensor in another file where a sample shows it helps. Qwen3-4B Q3_K_M + Q4_K_M: 2962 MiB instead of about 3920 as two files.
+- `tenz l archive.tenz` lists the files in an archive, from its header.
 - Fix: 0.25 files carried the magic of format 24.
 
 ## [0.25] - 2026-11-15

@@ -151,6 +151,7 @@ tenz c in.gguf out.tenz    # explicit output name
 tenz t model.gguf          # round-trip test in memory, writes nothing
 tenz c models/             # a folder: its .gguf and .safetensors files in one archive, models.tenz
 tenz d models.tenz out/    # makes the folder again (default: models)
+tenz l models.tenz         # lists the files in an archive: sizes, saved, seeded and copied segments
 tenz v                     # version
 ```
 
